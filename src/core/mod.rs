@@ -175,4 +175,50 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn list_files_includes_created_file() {
+        let directory = TestDirectory::new();
+        let storage = LocalStorage::new(&directory.0).unwrap();
+
+        storage.write_file("hello.txt", "hello").unwrap();
+
+        let files = storage.list_files().unwrap();
+
+        assert_eq!(files, vec!["hello.txt".to_string()]);
+    }
+
+    #[test]
+    fn list_files_returns_sorted_names() {
+        let directory = TestDirectory::new();
+        let storage = LocalStorage::new(&directory.0).unwrap();
+
+        storage.write_file("zeta.txt", "z").unwrap();
+        storage.write_file("alpha.txt", "a").unwrap();
+        storage.write_file("middle.txt", "m").unwrap();
+
+        let files = storage.list_files().unwrap();
+
+        assert_eq!(
+            files,
+            vec![
+                "alpha.txt".to_string(),
+                "middle.txt".to_string(),
+                "zeta.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_files_ignores_directories() {
+        let directory = TestDirectory::new();
+        let storage = LocalStorage::new(&directory.0).unwrap();
+
+        storage.write_file("hello.txt", "hello").unwrap();
+        std::fs::create_dir(directory.0.join("my_folder")).unwrap();
+
+        let files = storage.list_files().unwrap();
+
+        assert_eq!(files, vec!["hello.txt".to_string()]);
+    }
 }
