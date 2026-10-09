@@ -18,6 +18,15 @@ pub enum Commands {
 
     /// Show the current filesystem status
     Status,
+
+    /// Check the basic CLI environment
+    Doctor,
+
+    /// Write a test file to local storage
+    StorageWrite,
+
+    /// Read the test file from local storage
+    StorageRead,
 }
 
 #[cfg(test)]
