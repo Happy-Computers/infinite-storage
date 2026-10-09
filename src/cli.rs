@@ -34,8 +34,8 @@ mod tests {
 
     #[test]
     fn recognizes_status_command() {
-        let cli = Cli::try_parse_from(["infinitefs", "status"])
-            .expect("status command should be valid");
+        let cli =
+            Cli::try_parse_from(["infinitefs", "status"]).expect("status command should be valid");
 
         assert_eq!(cli.command, Commands::Status);
     }
