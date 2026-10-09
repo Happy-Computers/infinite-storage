@@ -30,6 +30,12 @@ pub enum Commands {
 
     /// List regular files in local test storage
     StorageList,
+
+    /// Create a directory in local test storage
+    StorageMkdir {
+        /// Name of the directory to create
+        name: String,
+    },
 }
 
 #[cfg(test)]

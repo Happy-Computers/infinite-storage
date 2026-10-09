@@ -67,5 +67,13 @@ fn main() {
             },
             Err(error) => eprintln!("Could not initialize storage: {error}"),
         },
+
+        Commands::StorageMkdir { name } => match LocalStorage::new(STORAGE_DIRECTORY) {
+            Ok(storage) => match storage.create_dir(&name) {
+                Ok(()) => println!("Directory created: {name}"),
+                Err(error) => eprintln!("Could not create directory '{name}': {error}"),
+            },
+            Err(error) => eprintln!("Could not initialize storage: {error}"),
+        },
     }
 }

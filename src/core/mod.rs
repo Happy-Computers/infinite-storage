@@ -52,6 +52,13 @@ impl LocalStorage {
         files.sort();
         Ok(files)
     }
+
+    pub fn create_dir(&self, name: &str) -> io::Result<()> {
+        validate_filename(name)?;
+
+        let path = self.root.join(name);
+        fs::create_dir_all(path)
+    }
 }
 
 /// Accept only simple filenames, never paths to other directories.
@@ -220,5 +227,28 @@ mod tests {
         let files = storage.list_files().unwrap();
 
         assert_eq!(files, vec!["hello.txt".to_string()]);
+    }
+
+    #[test]
+    fn creates_directory() {
+        let directory = TestDirectory::new();
+        let storage = LocalStorage::new(&directory.0).unwrap();
+
+        storage.create_dir("documents").unwrap();
+
+        assert!(directory.0.join("documents").is_dir());
+    }
+
+    #[test]
+    fn creating_existing_directory_succeeds() {
+        let directory = TestDirectory::new();
+        let storage = LocalStorage::new(&directory.0).unwrap();
+
+        storage.create_dir("documents").unwrap();
+
+        // Creating the same directory again should succeed.
+        storage.create_dir("documents").unwrap();
+
+        assert!(directory.0.join("documents").is_dir());
     }
 }
