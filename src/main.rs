@@ -49,5 +49,23 @@ fn main() {
             },
             Err(error) => eprintln!("Could not initialize storage: {error}"),
         },
+
+        Commands::StorageList => match LocalStorage::new(STORAGE_DIRECTORY) {
+            Ok(storage) => match storage.list_files() {
+                Ok(files) => {
+                    println!("Files in InfiniteFS storage:");
+
+                    if files.is_empty() {
+                        println!("(No files found)");
+                    } else {
+                        for file in files {
+                            println!("{file}");
+                        }
+                    }
+                }
+                Err(error) => eprintln!("Could not list files: {error}"),
+            },
+            Err(error) => eprintln!("Could not initialize storage: {error}"),
+        },
     }
 }

@@ -33,6 +33,25 @@ impl LocalStorage {
         let path = self.file_path(name)?;
         fs::read_to_string(path)
     }
+
+    pub fn list_files(&self) -> io::Result<Vec<String>> {
+        let mut files = Vec::new();
+
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+
+            // List regular files only, not directories or symbolic links.
+            if file_type.is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    files.push(name.to_owned());
+                }
+            }
+        }
+
+        files.sort();
+        Ok(files)
+    }
 }
 
 /// Accept only simple filenames, never paths to other directories.

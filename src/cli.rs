@@ -27,6 +27,9 @@ pub enum Commands {
 
     /// Read the test file from local storage
     StorageRead,
+
+    /// List regular files in local test storage
+    StorageList,
 }
 
 #[cfg(test)]
