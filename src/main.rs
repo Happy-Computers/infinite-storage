@@ -1,37 +1,16 @@
 
-use clap::{Parser, Subcommand};
+mod cli;
 
-#[derive(Parser)]
-#[command(
-    name = "infinitefs",
-    version,
-    about = "A cloud-backed filesystem for AI agents"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Show the CLI version
-    Version,
-
-    /// Show the current filesystem status
-    Status,
-}
+use clap::Parser;
+use cli::{Cli, Commands};
 
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Version => {
-            println!(
-                "InfiniteFS CLI v{}",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("InfiniteFS CLI v{}", env!("CARGO_PKG_VERSION"));
         }
-
         Commands::Status => {
             println!("InfiniteFS development status");
             println!("CLI: Running");
