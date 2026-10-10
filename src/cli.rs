@@ -22,18 +22,28 @@ pub enum Commands {
     /// Check the basic CLI environment
     Doctor,
 
-    /// Write a test file to local storage
-    StorageWrite,
+    /// Write one line of text to a relative file path
+    StorageWrite {
+        /// Relative file path, such as documents/reports/summary.txt
+        path: String,
+    },
 
-    /// Read the test file from local storage
-    StorageRead,
+    /// Read a text file from a relative file path
+    StorageRead {
+        /// Relative file path, such as documents/reports/summary.txt
+        path: String,
+    },
 
-    /// List regular files in local test storage
-    StorageList,
+    /// List files in the storage root or a relative directory
+    StorageList {
+        /// Relative directory, such as documents/reports
+        #[arg(value_name = "DIRECTORY")]
+        directory: Option<String>,
+    },
 
-    /// Create a directory in local test storage
+    /// Create a directory, including any missing parent directories
     StorageMkdir {
-        /// Name of the directory to create
+        /// Relative directory path, such as projects/infinitefs
         name: String,
     },
 }
@@ -44,24 +54,90 @@ mod tests {
 
     #[test]
     fn recognizes_version_command() {
-        let cli = Cli::try_parse_from(["infinitefs", "version"])
-            .expect("version command should be valid");
-
+        let cli = Cli::try_parse_from(["infinitefs", "version"]).unwrap();
         assert_eq!(cli.command, Commands::Version);
     }
 
     #[test]
     fn recognizes_status_command() {
-        let cli =
-            Cli::try_parse_from(["infinitefs", "status"]).expect("status command should be valid");
-
+        let cli = Cli::try_parse_from(["infinitefs", "status"]).unwrap();
         assert_eq!(cli.command, Commands::Status);
     }
 
     #[test]
-    fn rejects_unknown_command() {
-        let result = Cli::try_parse_from(["infinitefs", "unknown"]);
+    fn recognizes_storage_write_path() {
+        let cli = Cli::try_parse_from([
+            "infinitefs",
+            "storage-write",
+            "documents/reports/summary.txt",
+        ])
+        .unwrap();
 
-        assert!(result.is_err());
+        assert_eq!(
+            cli.command,
+            Commands::StorageWrite {
+                path: "documents/reports/summary.txt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_storage_read_path() {
+        let cli = Cli::try_parse_from([
+            "infinitefs",
+            "storage-read",
+            "documents/reports/summary.txt",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            Commands::StorageRead {
+                path: "documents/reports/summary.txt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_storage_list_without_directory() {
+        let cli = Cli::try_parse_from(["infinitefs", "storage-list"]).unwrap();
+
+        assert_eq!(cli.command, Commands::StorageList { directory: None });
+    }
+
+    #[test]
+    fn recognizes_storage_list_with_directory() {
+        let cli = Cli::try_parse_from(["infinitefs", "storage-list", "documents/reports"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Commands::StorageList {
+                directory: Some("documents/reports".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn recognizes_nested_directory_creation() {
+        let cli =
+            Cli::try_parse_from(["infinitefs", "storage-mkdir", "projects/infinitefs"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Commands::StorageMkdir {
+                name: "projects/infinitefs".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_file_path() {
+        assert!(Cli::try_parse_from(["infinitefs", "storage-read"]).is_err());
+        assert!(Cli::try_parse_from(["infinitefs", "storage-write"]).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_command() {
+        assert!(Cli::try_parse_from(["infinitefs", "unknown"]).is_err());
     }
 }
