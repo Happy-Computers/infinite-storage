@@ -53,11 +53,22 @@ impl LocalStorage {
         Ok(files)
     }
 
-    pub fn create_dir(&self, name: &str) -> io::Result<()> {
+    pub fn create_dir(&self, name: &str) -> io::Result<bool> {
         validate_filename(name)?;
 
         let path = self.root.join(name);
-        fs::create_dir_all(path)
+
+        match fs::create_dir(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if path.is_dir() {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -234,21 +245,34 @@ mod tests {
         let directory = TestDirectory::new();
         let storage = LocalStorage::new(&directory.0).unwrap();
 
-        storage.create_dir("documents").unwrap();
+        let created = storage.create_dir("documents").unwrap();
 
+        assert!(created);
         assert!(directory.0.join("documents").is_dir());
     }
 
     #[test]
-    fn creating_existing_directory_succeeds() {
+    fn creating_existing_directory_reports_existing() {
         let directory = TestDirectory::new();
         let storage = LocalStorage::new(&directory.0).unwrap();
 
-        storage.create_dir("documents").unwrap();
+        assert!(storage.create_dir("documents").unwrap());
 
-        // Creating the same directory again should succeed.
-        storage.create_dir("documents").unwrap();
+        let created = storage.create_dir("documents").unwrap();
 
+        assert!(!created);
         assert!(directory.0.join("documents").is_dir());
+    }
+
+    #[test]
+    fn creating_directory_where_file_exists_returns_error() {
+        let directory = TestDirectory::new();
+        let storage = LocalStorage::new(&directory.0).unwrap();
+
+        storage.write_file("documents", "I am a file").unwrap();
+
+        let error = storage.create_dir("documents").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 }
