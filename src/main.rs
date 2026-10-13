@@ -2,7 +2,7 @@ mod cli;
 mod core;
 
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, StorageCommands};
 use core::LocalStorage;
 use std::io::{self, Write};
 
@@ -33,22 +33,32 @@ fn main() {
             println!("Filesystem mount: Not implemented");
         }
 
-        Commands::StorageWrite { path } => {
-            let storage = match LocalStorage::new(STORAGE_DIRECTORY) {
-                Ok(storage) => storage,
-                Err(error) => {
-                    eprintln!("Could not initialize storage: {error}");
-                    return;
-                }
-            };
+        Commands::Storage { command } => {
+            run_storage_command(command);
+        }
+    }
+}
 
+fn run_storage_command(command: StorageCommands) {
+    let storage = match LocalStorage::new(STORAGE_DIRECTORY) {
+        Ok(storage) => storage,
+        Err(error) => {
+            eprintln!("Could not initialize storage: {error}");
+            return;
+        }
+    };
+
+    match command {
+        StorageCommands::Write { path } => {
             print!("Enter one line of text to write to '{path}': ");
+
             if let Err(error) = io::stdout().flush() {
                 eprintln!("Could not display input prompt: {error}");
                 return;
             }
 
             let mut contents = String::new();
+
             match io::stdin().read_line(&mut contents) {
                 Ok(0) => {
                     eprintln!("No input received; file was not written.");
@@ -67,58 +77,55 @@ fn main() {
 
             match storage.write_file(&path, &contents) {
                 Ok(()) => println!("File written: {path}"),
-                Err(error) => eprintln!("Could not write file '{path}': {error}"),
+                Err(error) => {
+                    eprintln!("Could not write file '{path}': {error}");
+                }
             }
         }
 
-        Commands::StorageRead { path } => match LocalStorage::new(STORAGE_DIRECTORY) {
-            Ok(storage) => match storage.read_file(&path) {
-                Ok(contents) => {
-                    println!("Contents of '{path}':");
-                    println!("{contents}");
-                }
-                Err(error) => eprintln!("Could not read file '{path}': {error}"),
-            },
-            Err(error) => eprintln!("Could not initialize storage: {error}"),
+        StorageCommands::Read { path } => match storage.read_file(&path) {
+            Ok(contents) => {
+                println!("Contents of '{path}':");
+                println!("{contents}");
+            }
+            Err(error) => {
+                eprintln!("Could not read file '{path}': {error}");
+            }
         },
 
-        Commands::StorageList { directory } => match LocalStorage::new(STORAGE_DIRECTORY) {
-            Ok(storage) => {
-                let result = match directory.as_deref() {
-                    Some(path) => storage.list_files_in(path),
-                    None => storage.list_files(),
-                };
+        StorageCommands::List { directory } => {
+            let result = match directory.as_deref() {
+                Some(path) => storage.list_files_in(path),
+                None => storage.list_files(),
+            };
 
-                match result {
-                    Ok(files) => {
-                        match directory.as_deref() {
-                            Some(path) => println!("Files in '{path}':"),
-                            None => println!("Files in InfiniteFS storage:"),
-                        }
+            match result {
+                Ok(files) => {
+                    match directory.as_deref() {
+                        Some(path) => println!("Files in '{path}':"),
+                        None => println!("Files in InfiniteFS storage:"),
+                    }
 
-                        if files.is_empty() {
-                            println!("(No files found)");
-                        } else {
-                            for file in files {
-                                println!("{file}");
-                            }
+                    if files.is_empty() {
+                        println!("(No files found)");
+                    } else {
+                        for file in files {
+                            println!("{file}");
                         }
                     }
-                    Err(error) => eprintln!("Could not list files: {error}"),
+                }
+                Err(error) => {
+                    eprintln!("Could not list files: {error}");
                 }
             }
-            Err(error) => eprintln!("Could not initialize storage: {error}"),
-        },
+        }
 
-        Commands::StorageMkdir { name } => match LocalStorage::new(STORAGE_DIRECTORY) {
-            Ok(storage) => match storage.create_dir(&name) {
-                Ok(true) => println!("Directory created: {name}"),
-                Ok(false) => println!("Directory already exists: {name}"),
-                Err(error) => {
-                    eprintln!("Could not create directory '{name}': {error}");
-                }
-            },
-            Err(error) => eprintln!("Could not initialize storage: {error}"),
+        StorageCommands::Mkdir { path } => match storage.create_dir(&path) {
+            Ok(true) => println!("Directory created: {path}"),
+            Ok(false) => println!("Directory already exists: {path}"),
+            Err(error) => {
+                eprintln!("Could not create directory '{path}': {error}");
+            }
         },
     }
 }
