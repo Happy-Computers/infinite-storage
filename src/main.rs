@@ -1,5 +1,6 @@
 mod cli;
 mod core;
+mod tui;
 
 use clap::Parser;
 use cli::{Cli, Commands, StorageCommands};
@@ -35,6 +36,12 @@ fn main() {
 
         Commands::Storage { command } => {
             run_storage_command(command);
+        }
+
+        Commands::Tui => {
+            if let Err(error) = tui::run() {
+                eprintln!("TUI error: {error}");
+            }
         }
     }
 }

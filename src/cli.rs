@@ -22,6 +22,9 @@ pub enum Commands {
     /// Check the basic CLI environment
     Doctor,
 
+    /// Open the interactive terminal interface
+    Tui,
+
     /// Manage local InfiniteFS storage
     Storage {
         #[command(subcommand)]
