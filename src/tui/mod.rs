@@ -7,77 +7,121 @@ use ratatui::{
 };
 use std::{
     fs, io,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Component, Path, PathBuf},
 };
 
-struct DemoStorage {
+const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
+
+const CONTROLS: &str = "Up/Down: Navigate | Enter: Open | Backspace: Up | q: Quit";
+
+/// Read-only browser restricted to one configured storage directory.
+struct LocalBrowser {
     root: PathBuf,
 }
 
-impl DemoStorage {
-    fn new() -> io::Result<Self> {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+impl LocalBrowser {
+    fn new(root: impl AsRef<Path>) -> io::Result<Self> {
+        let configured_root = root.as_ref();
 
-        let temporary_root = std::env::temp_dir().join(format!("infinitefs-tui-demo-{unique}"));
+        // Never create the storage directory automatically.
+        if !configured_root.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Storage directory does not exist: {}",
+                    configured_root.display()
+                ),
+            ));
+        }
 
-        fs::create_dir_all(temporary_root.join("Documents"))?;
-        fs::create_dir_all(temporary_root.join("Projects"))?;
+        let metadata = fs::symlink_metadata(configured_root)?;
 
-        fs::write(
-            temporary_root.join("welcome.txt"),
-            "Welcome to InfiniteFS!\nThis is temporary demo data.",
-        )?;
+        // Reject a storage root that is itself a symbolic link.
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Storage root must be a real directory, not a symbolic link",
+            ));
+        }
 
-        fs::write(
-            temporary_root.join("Documents").join("notes.txt"),
-            "Your notes will appear here.",
-        )?;
+        let root = configured_root.canonicalize()?;
 
-        fs::write(
-            temporary_root.join("Projects").join("readme.txt"),
-            "Example project folder.",
-        )?;
-
-        let root = temporary_root.canonicalize()?;
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Storage root is not a directory",
+            ));
+        }
 
         Ok(Self { root })
     }
 
-    fn entries(&self, relative: &Path) -> io::Result<Vec<Entry>> {
-        // The TUI only browses paths relative to its isolated demo root.
+    /// Resolve a relative path and ensure it remains inside the root.
+    fn checked_path(&self, relative: &Path) -> io::Result<PathBuf> {
         if relative.is_absolute()
             || relative.components().any(|component| {
                 matches!(
                     component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
                 )
             })
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Invalid directory",
+                "Path must remain inside the storage directory",
             ));
         }
 
-        let directory = self.root.join(relative);
-        let canonical = directory.canonicalize()?;
+        let candidate = self.root.join(relative);
 
-        if !canonical.starts_with(&self.root) || !canonical.is_dir() {
+        // Check every existing component so navigation cannot pass
+        // through a symbolic link.
+        let mut current = self.root.clone();
+
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+
+            current.push(name);
+
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Symbolic links are not allowed",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let canonical = candidate.canonicalize()?;
+
+        if !canonical.starts_with(&self.root) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Invalid directory",
+                "Path is outside the storage directory",
+            ));
+        }
+
+        Ok(canonical)
+    }
+
+    fn entries(&self, relative: &Path) -> io::Result<Vec<Entry>> {
+        let directory = self.checked_path(relative)?;
+
+        if !directory.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Selected path is not a directory",
             ));
         }
 
         let mut entries = Vec::new();
 
-        for item in fs::read_dir(&canonical)? {
+        for item in fs::read_dir(&directory)? {
             let item = item?;
             let file_type = item.file_type()?;
 
@@ -87,79 +131,129 @@ impl DemoStorage {
             }
 
             if file_type.is_dir() || file_type.is_file() {
+                let name = item.file_name().to_string_lossy().into_owned();
+                let metadata = item.metadata()?;
+
+                let kind = FileKind::from_name(&name, file_type.is_dir());
+
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| {
+                        let seconds = duration.as_secs();
+                        format!("Unix timestamp: {seconds}")
+                    })
+                    .unwrap_or_else(|| "Unavailable".to_string());
+
                 entries.push(Entry {
-                    name: item.file_name().to_string_lossy().into_owned(),
+                    name,
                     is_dir: file_type.is_dir(),
+                    kind,
+                    size: metadata.len(),
+                    modified,
                 });
             }
         }
 
-        // Display directories first, followed by files, alphabetically.
+        // Directories first, then files; alphabetically within each group.
         entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
 
         Ok(entries)
     }
 
     fn read_text_file(&self, relative: &Path) -> io::Result<String> {
-        if relative.is_absolute()
-            || relative.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Invalid file path",
-            ));
-        }
+        let path = self.checked_path(relative)?;
+        let metadata = fs::metadata(&path)?;
 
-        let path = self.root.join(relative);
-        let metadata = fs::symlink_metadata(&path)?;
-
-        if !metadata.file_type().is_file() {
+        if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Only regular text files can be previewed",
             ));
         }
 
-        let canonical = path.canonicalize()?;
-
-        if !canonical.starts_with(&self.root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "File is outside the demo directory",
-            ));
-        }
-
-        // Limit preview size to avoid loading large files into memory.
-        const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
-
-        if fs::metadata(&canonical)?.len() > MAX_PREVIEW_BYTES {
+        if metadata.len() > MAX_PREVIEW_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "File is larger than the 1 MiB preview limit",
             ));
         }
 
-        fs::read_to_string(canonical)
+        fs::read_to_string(path)
     }
 }
 
-impl Drop for DemoStorage {
-    fn drop(&mut self) {
-        // Only remove this run's temporary demo directory.
-        let _ = fs::remove_dir_all(&self.root);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileKind {
+    Folder,
+    Image,
+    Video,
+    Text,
+    Archive,
+    Unknown,
+}
+
+impl FileKind {
+    fn from_name(name: &str, is_dir: bool) -> Self {
+        if is_dir {
+            return Self::Folder;
+        }
+
+        let extension = Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match extension.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff" | "ico" | "avif" => {
+                Self::Image
+            }
+
+            "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" | "mpeg" | "mpg" | "wmv" | "3gp" => {
+                Self::Video
+            }
+
+            "txt" | "md" | "rs" | "toml" | "json" | "yaml" | "yml" | "xml" | "html" | "css"
+            | "js" | "ts" | "py" | "java" | "c" | "cpp" | "h" | "sh" | "ps1" | "sql" | "log"
+            | "csv" | "ini" => Self::Text,
+
+            "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" | "zst" => Self::Archive,
+
+            _ => Self::Unknown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Folder => "Folder",
+            Self::Image => "Image",
+            Self::Video => "Video",
+            Self::Text => "Text file",
+            Self::Archive => "Archive",
+            Self::Unknown => "Unknown file",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Folder => "[DIR]",
+            Self::Image => "[IMG]",
+            Self::Video => "[VID]",
+            Self::Text => "[TXT]",
+            Self::Archive => "[ZIP]",
+            Self::Unknown => "[FILE]",
+        }
     }
 }
 
 struct Entry {
     name: String,
     is_dir: bool,
+    kind: FileKind,
+    size: u64,
+    modified: String,
 }
 
 struct App {
@@ -171,21 +265,26 @@ struct App {
 }
 
 impl App {
-    fn new(storage: &DemoStorage) -> io::Result<Self> {
+    fn new(storage: &LocalBrowser) -> io::Result<Self> {
         Ok(Self {
             current_dir: PathBuf::new(),
             entries: storage.entries(Path::new(""))?,
             selected: 0,
-            message: "Up/Down: Navigate | Enter: Open | Backspace: Up | q: Quit".into(),
+            message: CONTROLS.into(),
             preview: None,
         })
     }
 
-    fn refresh(&mut self, storage: &DemoStorage) {
+    fn refresh(&mut self, storage: &LocalBrowser) {
         match storage.entries(&self.current_dir) {
             Ok(entries) => {
                 self.entries = entries;
                 self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+                self.message = if self.entries.is_empty() {
+                    "This directory is empty.".into()
+                } else {
+                    CONTROLS.into()
+                };
             }
             Err(error) => {
                 self.message = format!("Could not list directory: {error}");
@@ -193,7 +292,7 @@ impl App {
         }
     }
 
-    fn open_selected(&mut self, storage: &DemoStorage) {
+    fn open_selected(&mut self, storage: &LocalBrowser) {
         let Some(entry) = self.entries.get(self.selected) else {
             return;
         };
@@ -220,7 +319,7 @@ impl App {
         }
     }
 
-    fn go_up(&mut self, storage: &DemoStorage) {
+    fn go_up(&mut self, storage: &LocalBrowser) {
         if self.current_dir.pop() {
             self.selected = 0;
             self.refresh(storage);
@@ -228,8 +327,8 @@ impl App {
     }
 }
 
-pub fn run() -> io::Result<()> {
-    let storage = DemoStorage::new()?;
+pub fn run(root: impl AsRef<Path>) -> io::Result<()> {
+    let storage = LocalBrowser::new(root)?;
     let mut app = App::new(&storage)?;
 
     let terminal = ratatui::init();
@@ -246,7 +345,11 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn run_loop(mut terminal: DefaultTerminal, app: &mut App, storage: &DemoStorage) -> io::Result<()> {
+fn run_loop(
+    mut terminal: DefaultTerminal,
+    app: &mut App,
+    storage: &LocalBrowser,
+) -> io::Result<()> {
     loop {
         terminal.draw(|frame| draw(frame, app))?;
 
@@ -255,13 +358,11 @@ fn run_loop(mut terminal: DefaultTerminal, app: &mut App, storage: &DemoStorage)
                 continue;
             }
 
-            // While previewing, keep navigation keys inside the preview.
             if app.preview.is_some() {
                 match key.code {
                     KeyCode::Esc | KeyCode::Backspace => {
                         app.preview = None;
-                        app.message =
-                            "Up/Down: Navigate | Enter: Open | Backspace: Up | q: Quit".into();
+                        app.message = CONTROLS.into();
                     }
                     KeyCode::Char('q') => return Ok(()),
                     _ => {}
@@ -290,9 +391,7 @@ fn run_loop(mut terminal: DefaultTerminal, app: &mut App, storage: &DemoStorage)
                 }
 
                 KeyCode::Enter => app.open_selected(storage),
-
                 KeyCode::Backspace => app.go_up(storage),
-
                 _ => {}
             }
         }
@@ -332,7 +431,6 @@ fn draw(frame: &mut Frame, app: &App) {
         frame.render_widget(title, layout[0]);
         frame.render_widget(body, layout[1]);
         frame.render_widget(footer, layout[2]);
-
         return;
     }
 
@@ -369,9 +467,9 @@ fn draw(frame: &mut Frame, app: &App) {
         .iter()
         .map(|entry| {
             let label = if entry.is_dir {
-                format!("[DIR]  {}/", entry.name)
+                format!("{}  {}/", entry.kind.icon(), entry.name)
             } else {
-                format!("       {}", entry.name)
+                format!("{}  {}", entry.kind.icon(), entry.name)
             };
 
             ListItem::new(label)

@@ -39,7 +39,7 @@ fn main() {
         }
 
         Commands::Tui => {
-            if let Err(error) = tui::run() {
+            if let Err(error) = tui::run(STORAGE_DIRECTORY) {
                 eprintln!("TUI error: {error}");
             }
         }
