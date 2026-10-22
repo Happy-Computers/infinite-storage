@@ -24,6 +24,16 @@
 | PowerShell | Windows development and testing | In use |
 | VS Code | Code editor | Development tool |
 
+### Image Preview
+
+- `image` — Decodes image files into pixel data.
+- `ratatui-image` — Renders images inside the Ratatui TUI.
+- Rendering strategy — Unicode half-block fallback for broad terminal compatibility.
+- Image processing — Decode only when previewing; resize to fit the preview panel.
+- Security — Restrict image dimensions and decoded memory usage for untrusted files.
+- Current status — Dependencies being integrated; video previews are planned separately.
+
+
 ## Current Application Features
 
 - Version, status and doctor CLI commands.
