@@ -40,7 +40,35 @@ Check formatting:
 cargo fmt --check
 ```
 
+Check lints:
+
+```bash
+cargo clippy --locked --all-targets -- -D warnings
+```
+
 All checks should pass before submitting a pull request.
+
+### Pre-commit Hooks
+
+The repository uses [prek](https://prek.j178.dev/) to run formatting, linting, and tests before each commit. Install prek first, either from the [installation guide](https://prek.j178.dev/installation/) or with Cargo:
+
+```bash
+cargo install --locked prek
+```
+
+Then install the Git hook once per clone:
+
+```bash
+prek install
+```
+
+Run the checks on demand with:
+
+```bash
+prek run --all-files
+```
+
+jj does not run Git commit hooks, so jj users should run that command before pushing.
 
 ## How to Contribute
 
@@ -71,7 +99,7 @@ For a feature, use a name such as `feature/describe-the-feature`.
 
 - Keep changes focused.
 - Add or update tests where appropriate.
-- Run `cargo fmt --check`, `cargo check`, and `cargo test`.
+- Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo check --locked`, and `cargo test --locked`.
 - Review your changes before committing.
 
 ### 5. Commit and Push
