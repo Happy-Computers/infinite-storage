@@ -117,15 +117,14 @@ mod tests {
 
     #[test]
     fn explicit_override_is_used() {
-        let lookup = lookup_from(&[
-            (STORAGE_DIRECTORY_ENV, "/tmp/infinite-storage-test-data"),
-            ("HOME", "/home/test"),
-        ]);
+        // The override must be absolute on every platform, so use the
+        // platform's temporary directory rather than a POSIX-only path.
+        let override_path = std::env::temp_dir().join("infinite-storage-test-data");
+        let override_value = override_path.to_string_lossy().into_owned();
+        let variables = [(STORAGE_DIRECTORY_ENV, override_value.as_str())];
+        let lookup = lookup_from(&variables);
 
-        assert_eq!(
-            storage_directory_from(lookup).unwrap(),
-            PathBuf::from("/tmp/infinite-storage-test-data")
-        );
+        assert_eq!(storage_directory_from(lookup).unwrap(), override_path);
     }
 
     #[cfg(not(windows))]
