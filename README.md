@@ -1,36 +1,36 @@
 # InfiniteFS
 
-**A cloud-backed filesystem for AI agents — under development.**
+A cloud filesystem that's infinitely scalable for humans and agents alike. Early development.
 
-InfiniteFS is an experimental project exploring how AI agents and applications can work with files through a filesystem-like interface while keeping persistent storage in the cloud.
+InfiniteFS is an experimental filesystem interface for AI agents. Files stay in cloud storage, and programs read and write them with ordinary path operations.
 
-The goal is to make cloud-stored files easier to access and work with, without requiring every file to be permanently stored on the local machine.
+The goal is to read and write cloud files without keeping a permanent local copy of every file.
 
-> **Project status:** Early development. The Rust CLI foundation and local filesystem browser are implemented. Cloud-backed storage, streaming, caching, and filesystem mounting are planned and are not yet complete.
+> Project status: early development. The Rust CLI and local filesystem browser work. Cloud storage, streaming, caching, and filesystem mounting are not implemented.
 
-## Current Features
+## Current features
 
-- **Rust CLI:** Command-line foundation with version, status, and diagnostic commands.
-- **Local storage:** Basic file operations with path validation.
-- **Terminal UI:** Browse files and directories within the configured local data directory.
-- **Text preview:** Preview supported text files within a size limit.
-- **Media opening:** Open supported image and video files using the operating system's default application.
-- **Safety checks:** Validate file paths, reject path traversal, and check symbolic links in relevant local filesystem operations.
-- **Automated tests:** Unit tests for core storage and terminal UI functionality.
+- CLI commands for version, status, diagnostics, local storage, and the terminal UI.
+- Local storage operations: write, read, list, and create directories, with path validation.
+- A terminal UI for browsing the configured storage directory.
+- Text preview for supported files up to 1 MB.
+- Opens images and videos in the operating system's default application.
+- Path validation rejects traversal, absolute paths, and symbolic links.
+- Unit tests cover storage, path rules, storage location, CLI parsing, and the terminal UI.
 
-## Planned Roadmap
+## Planned roadmap
 
 - [ ] Introduce a storage abstraction for local and cloud backends.
 - [ ] Integrate Amazon S3 using the AWS SDK for Rust.
-- [ ] Implement efficient streaming and caching.
-- [ ] Explore a mounted Windows filesystem using WinFsp.
+- [ ] Implement streaming and caching.
+- [ ] Mount the storage as a Windows filesystem with WinFsp.
 - [ ] Improve support for AI-agent file workflows.
 - [ ] Benchmark performance, latency, bandwidth, and storage costs.
 - [ ] Expand security testing and documentation.
 
-These are planned capabilities, not promises of a release date.
+None of these have a release date.
 
-## Technology Stack
+## Technology stack
 
 | Component | Technology |
 |---|---|
@@ -45,92 +45,92 @@ These are planned capabilities, not promises of a release date.
 
 ## Requirements
 
-- Windows 11 or another supported Rust development environment.
-- Rust toolchain and Cargo.
+- Linux, macOS, or Windows.
+- The Rust toolchain and Cargo.
 - A terminal and Git for development.
 
-The current development configuration uses Windows and a local data directory at `F:\infiniteFS_Data`. This path is specific to the current development setup; it is not a universal installation path.
+The storage directory defaults to a per-user application data directory and can be overridden with the `INFINITE_STORAGE_DATA` environment variable.
 
-## Getting Started
+## Getting started
 
 ### 1. Clone the repository
 
-```powershell
+```bash
 git clone https://github.com/Sahil4912/infinitefs.git
 cd infinitefs
 ```
 
 ### 2. Build the project
 
-```powershell
+```bash
 cargo check
 ```
 
 ### 3. Run the tests
 
-```powershell
+```bash
 cargo test
 ```
 
 ### 4. Format the code
 
-```powershell
+```bash
 cargo fmt
 ```
 
 ### 5. View the available CLI commands
 
-```powershell
+```bash
 cargo run -- --help
 ```
 
-Consult the CLI help output for the commands supported by your current build.
+### Local data directory
 
-### Local Data Directory
+The storage directory is resolved when a command needs it:
 
-The current TUI development configuration uses:
+1. `INFINITE_STORAGE_DATA`, if set.
+2. `$XDG_DATA_HOME/infinite-storage` when `XDG_DATA_HOME` is set.
+3. `$HOME/.local/share/infinite-storage` otherwise.
+4. On Windows, `%LOCALAPPDATA%\infinite-storage`, falling back to
+   `%USERPROFILE%\infinite-storage`.
 
-```text
-F:\infiniteFS_Data
+The directory is created automatically. Override the location for development or tests:
+
+```bash
+INFINITE_STORAGE_DATA=/tmp/infinite-storage-data infinitefs storage list
 ```
 
-Create this directory yourself before launching the TUI if it does not exist. Keep test files and development data separate from important personal files.
+Keep test files and development data separate from important personal files.
 
-**Important:** Do not assume the current local browser is already a mounted cloud filesystem. S3 integration and cloud-backed file access remain planned work.
+The local browser is not a mounted cloud filesystem. S3 integration and cloud-backed access are planned.
 
 ## Security
 
-Security is an important design goal for InfiniteFS.
-
-Current development includes local path validation and checks intended to restrict filesystem operations to the configured data directory. These safeguards are still evolving and should not be treated as a complete security audit.
+The CLI validates every path before it touches the local filesystem and rejects symbolic links and traversal. These safeguards are still evolving and have not been audited.
 
 - Never commit AWS credentials, passwords, access tokens, or private keys.
 - Use secure AWS credential providers when cloud integration is introduced.
 - Review changes that affect path validation, symbolic links, storage access, or permissions carefully.
-- Do not use experimental builds with sensitive data without independently assessing their safety.
+- Do not use experimental builds with sensitive data without assessing their safety yourself.
 
-For vulnerability reports, follow the instructions in [`SECURITY.md`](SECURITY.md) once that file is available.
+For vulnerability reports, see [`SECURITY.md`](SECURITY.md).
 
 ## Contributing
 
 Contributions, bug reports, and suggestions are welcome.
 
-Before making a substantial change, open an issue to discuss the proposed approach. For code contributions, use a fork and pull request so changes can be reviewed before merging.
+Before a substantial change, open an issue to discuss the approach. Contribute code through a fork and pull request so changes can be reviewed before merging.
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution guidelines once available.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, hooks, and review expectations.
 
 ## Licence
 
 InfiniteFS is licensed under the MIT Licence. See [`LICENSE`](LICENSE) for the complete licence text.
 
-## Project Goals
-
-InfiniteFS aims to explore a practical filesystem-like interface for cloud-backed data access, with a focus on:
+## Project goals
 
 - Efficient access to large files.
-- Low latency and reduced unnecessary local storage.
+- Low latency and less local storage.
 - Safe filesystem operations.
-- Developer and AI-agent usability.
-- Transparent performance and cost trade-offs.
-
-The project is experimental, and its architecture and implementation may evolve as these goals are tested.
+- Usability for developers and AI agents.
+- Clear performance and cost trade-offs.
