@@ -2,7 +2,7 @@
 
 A cloud filesystem that's infinitely scalable for humans and agents alike. Early development.
 
-InfiniteFS is an experimental filesystem interface for AI agents. Files stay in cloud storage, and programs read and write them with ordinary path operations.
+InfiniteFS is an experimental filesystem interface for AI agents. It aims to keep files in cloud storage and let programs read and write them with ordinary path operations.
 
 The goal is to read and write cloud files without keeping a permanent local copy of every file.
 
