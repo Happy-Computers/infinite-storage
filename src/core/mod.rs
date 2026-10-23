@@ -1,3 +1,4 @@
+use crate::vpath::VPath;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,8 @@ impl LocalStorage {
 
     /// Resolve a validated relative path and reject existing symbolic links.
     fn checked_path(&self, name: &str) -> io::Result<PathBuf> {
-        let components = validate_relative_path(name)?;
+        let virtual_path = VPath::parse(name)?;
+        let components = virtual_path.components();
         let mut path = self.root.clone();
 
         for (index, component) in components.iter().enumerate() {
@@ -120,57 +122,6 @@ impl LocalStorage {
 
 fn invalid_path(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
-}
-
-/// Validate a relative path using either slash style.
-/// Absolute paths, traversal components, empty components and invalid
-/// filename characters are rejected.
-fn validate_relative_path(name: &str) -> io::Result<Vec<&str>> {
-    if name.is_empty() || name.starts_with('/') || name.starts_with('\\') || name.contains(':') {
-        return Err(invalid_path("Expected a safe relative path"));
-    }
-
-    let components: Vec<&str> = name.split(['/', '\\']).collect();
-
-    if components.is_empty() {
-        return Err(invalid_path("Path cannot be empty"));
-    }
-
-    for component in &components {
-        validate_component(component)?;
-    }
-
-    Ok(components)
-}
-
-fn validate_component(name: &str) -> io::Result<()> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.starts_with('.')
-        || name.ends_with('.')
-        || name.len() > 255
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-    {
-        return Err(invalid_path("Invalid path component"));
-    }
-
-    // Windows reserves these device names, including when an extension
-    // is present (for example, CON.txt).
-    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
-
-    if reserved {
-        return Err(invalid_path("Reserved filename"));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
