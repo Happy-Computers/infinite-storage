@@ -21,7 +21,14 @@ where
     F: Fn(&str) -> Option<OsString>,
 {
     if let Some(path) = environment_value(&lookup, STORAGE_DIRECTORY_ENV) {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{STORAGE_DIRECTORY_ENV} must be an absolute path"),
+            ));
+        }
+        return Ok(path);
     }
 
     default_storage_directory(&lookup)
@@ -36,6 +43,19 @@ where
     lookup(name).filter(|value| !value.is_empty())
 }
 
+/// Return an environment variable's value as an absolute path.
+///
+/// The XDG base directory specification requires `XDG_DATA_HOME` to be
+/// absolute. A relative value would make the storage location depend on the
+/// working directory, which is what this module exists to prevent.
+fn environment_path<F>(lookup: &F, name: &str) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    let path = PathBuf::from(environment_value(lookup, name)?);
+    if path.is_absolute() { Some(path) } else { None }
+}
+
 /// POSIX defines `HOME` as the user's home directory. `XDG_DATA_HOME` is the
 /// established convention for user application data on the Unix-like systems
 /// we support, so it takes precedence when set.
@@ -44,19 +64,19 @@ fn default_storage_directory<F>(lookup: &F) -> io::Result<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    if let Some(data_home) = environment_value(lookup, "XDG_DATA_HOME") {
-        return Ok(PathBuf::from(data_home).join(STORAGE_DIRECTORY_NAME));
+    if let Some(data_home) = environment_path(lookup, "XDG_DATA_HOME") {
+        return Ok(data_home.join(STORAGE_DIRECTORY_NAME));
     }
 
-    match environment_value(lookup, "HOME") {
-        Some(home) => Ok(PathBuf::from(home)
+    match environment_path(lookup, "HOME") {
+        Some(home) => Ok(home
             .join(".local")
             .join("share")
             .join(STORAGE_DIRECTORY_NAME)),
         None => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "neither XDG_DATA_HOME nor HOME is set; set INFINITE_STORAGE_DATA to choose a \
-             storage directory",
+            "neither XDG_DATA_HOME nor HOME is set to an absolute path; set \
+             INFINITE_STORAGE_DATA to choose a storage directory",
         )),
     }
 }
@@ -66,16 +86,16 @@ fn default_storage_directory<F>(lookup: &F) -> io::Result<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    if let Some(local_app_data) = environment_value(lookup, "LOCALAPPDATA") {
-        return Ok(PathBuf::from(local_app_data).join(STORAGE_DIRECTORY_NAME));
+    if let Some(local_app_data) = environment_path(lookup, "LOCALAPPDATA") {
+        return Ok(local_app_data.join(STORAGE_DIRECTORY_NAME));
     }
 
-    match environment_value(lookup, "USERPROFILE") {
-        Some(user_profile) => Ok(PathBuf::from(user_profile).join(STORAGE_DIRECTORY_NAME)),
+    match environment_path(lookup, "USERPROFILE") {
+        Some(user_profile) => Ok(user_profile.join(STORAGE_DIRECTORY_NAME)),
         None => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "neither LOCALAPPDATA nor USERPROFILE is set; set INFINITE_STORAGE_DATA to choose a \
-             storage directory",
+            "neither LOCALAPPDATA nor USERPROFILE is set to an absolute path; set \
+             INFINITE_STORAGE_DATA to choose a storage directory",
         )),
     }
 }
@@ -148,6 +168,37 @@ mod tests {
     #[test]
     fn missing_home_is_an_error() {
         let error = storage_directory_from(lookup_from(&[])).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn relative_override_is_rejected() {
+        let lookup = lookup_from(&[
+            (STORAGE_DIRECTORY_ENV, "relative/data"),
+            ("HOME", "/home/test"),
+        ]);
+
+        let error = storage_directory_from(lookup).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn relative_xdg_data_home_falls_back_to_home() {
+        let lookup = lookup_from(&[("XDG_DATA_HOME", "relative/data"), ("HOME", "/home/test")]);
+
+        assert_eq!(
+            storage_directory_from(lookup).unwrap(),
+            PathBuf::from("/home/test/.local/share/infinite-storage")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn relative_home_is_not_used() {
+        let error = storage_directory_from(lookup_from(&[("HOME", "relative/home")])).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
