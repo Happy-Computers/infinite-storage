@@ -1,13 +1,16 @@
 mod cli;
 mod core;
+mod platform;
 mod tui;
+mod vpath;
 
 use clap::Parser;
 use cli::{Cli, Commands, StorageCommands};
 use core::LocalStorage;
-use std::io::{self, Write};
-
-const STORAGE_DIRECTORY: &str = r"F:\infiniteFS_Data";
+use std::{
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 fn main() {
     let cli = Cli::parse();
@@ -29,25 +32,46 @@ fn main() {
         Commands::Doctor => {
             println!("InfiniteFS diagnostic check");
             println!("CLI: Available");
-            println!("Local storage path: {STORAGE_DIRECTORY}");
+
+            match platform::storage_directory() {
+                Ok(directory) => println!("Local storage path: {}", directory.display()),
+                Err(error) => println!("Local storage path: unavailable ({error})"),
+            }
+
             println!("Cloud storage: Not configured");
             println!("Filesystem mount: Not implemented");
         }
 
         Commands::Storage { command } => {
-            run_storage_command(command);
+            if let Some(directory) = storage_directory() {
+                run_storage_command(&directory, command);
+            }
         }
 
         Commands::Tui => {
-            if let Err(error) = tui::run(STORAGE_DIRECTORY) {
+            if let Some(directory) = storage_directory()
+                && let Err(error) = tui::run(&directory)
+            {
                 eprintln!("TUI error: {error}");
             }
         }
     }
 }
 
-fn run_storage_command(command: StorageCommands) {
-    let storage = match LocalStorage::new(STORAGE_DIRECTORY) {
+/// Resolved per command so informational commands such as `version` keep
+/// working even when the environment is incomplete.
+fn storage_directory() -> Option<PathBuf> {
+    match platform::storage_directory() {
+        Ok(directory) => Some(directory),
+        Err(error) => {
+            eprintln!("Could not resolve the storage directory: {error}");
+            None
+        }
+    }
+}
+
+fn run_storage_command(storage_directory: &Path, command: StorageCommands) {
+    let storage = match LocalStorage::new(storage_directory) {
         Ok(storage) => storage,
         Err(error) => {
             eprintln!("Could not initialize storage: {error}");
