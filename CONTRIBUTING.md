@@ -50,7 +50,13 @@ All checks should pass before submitting a pull request.
 
 ### Pre-commit Hooks
 
-The repository uses [prek](https://prek.j178.dev/) to run formatting, linting, and tests before each commit. Install the hook once per clone:
+The repository uses [prek](https://prek.j178.dev/) to run formatting, linting, and tests before each commit. Install prek first, either from the [installation guide](https://prek.j178.dev/installation/) or with Cargo:
+
+```bash
+cargo install --locked prek
+```
+
+Then install the Git hook once per clone:
 
 ```bash
 prek install
