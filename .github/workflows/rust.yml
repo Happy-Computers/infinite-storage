@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   test:
-    name: Format, Check, and Test
+    name: Format, Lint, and Test
     runs-on: ubuntu-latest
 
     steps:
@@ -24,10 +24,13 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: clippy, rustfmt
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Compile project
         run: cargo check --locked

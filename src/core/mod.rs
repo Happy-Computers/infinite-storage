@@ -79,10 +79,10 @@ impl LocalStorage {
             let entry = entry?;
             let file_type = entry.file_type()?;
 
-            if file_type.is_file() {
-                if let Some(name) = entry.file_name().to_str() {
-                    files.push(name.to_owned());
-                }
+            if file_type.is_file()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                files.push(name.to_owned());
             }
         }
 
