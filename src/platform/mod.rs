@@ -120,9 +120,9 @@ mod tests {
         // The override must be absolute on every platform, so use the
         // platform's temporary directory rather than a POSIX-only path.
         let override_path = std::env::temp_dir().join("infinite-storage-test-data");
-        let override_value = override_path.to_string_lossy().into_owned();
-        let variables = [(STORAGE_DIRECTORY_ENV, override_value.as_str())];
-        let lookup = lookup_from(&variables);
+        let lookup = |name: &str| {
+            (name == STORAGE_DIRECTORY_ENV).then(|| override_path.clone().into_os_string())
+        };
 
         assert_eq!(storage_directory_from(lookup).unwrap(), override_path);
     }
