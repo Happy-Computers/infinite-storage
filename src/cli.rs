@@ -2,9 +2,9 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "infinitefs",
+    name = "infs",
     version,
-    about = "A cloud-backed filesystem for AI agents"
+    about = "infinite storage for humans and agents"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -13,19 +13,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq)]
 pub enum Commands {
-    /// Show the CLI version
     Version,
-
-    /// Show the current filesystem status
     Status,
-
-    /// Check the basic CLI environment
     Doctor,
-
-    /// Open the interactive terminal interface
     Tui,
-
-    /// Manage local InfiniteFS storage
     Storage {
         #[command(subcommand)]
         command: StorageCommands,
@@ -34,28 +25,17 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug, PartialEq)]
 pub enum StorageCommands {
-    /// Write one line of text to a relative file path
     Write {
-        /// Relative file path, such as documents/reports/summary.txt
         path: String,
     },
-
-    /// Read a text file
     Read {
-        /// Relative file path, such as documents/reports/summary.txt
         path: String,
     },
-
-    /// List files in the storage root or a relative directory
     List {
-        /// Optional relative directory
         #[arg(value_name = "DIRECTORY")]
         directory: Option<String>,
     },
-
-    /// Create a directory and any missing parent directories
     Mkdir {
-        /// Relative directory path, such as projects/infinitefs
         path: String,
     },
 }

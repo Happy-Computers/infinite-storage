@@ -52,3 +52,31 @@ Keep test files and development data separate from important personal files.
 
 The local browser is not a mounted cloud filesystem. S3 integration and cloud-backed access are planned.
 
+## Test live reads with MinIO
+
+Run the MinIO-backed integration test to check the experimental `store-stream` dependency:
+
+```bash
+./scripts/test_minio_stream.sh
+```
+
+The script downloads a pinned MinIO binary into `/tmp/opencode/infinitefs-minio` when needed.
+It starts an isolated server on `127.0.0.1:19000` and uploads fixed chunks.
+It reads confirmed chunks before the upload finishes, then checks the completed object.
+The server and its data are removed after a successful run.
+
+This experiment does not add cloud storage commands or cloud configuration to the InfiniteFS CLI.
+
+To stream a local file through MinIO, pass a source file and a new output path:
+
+```bash
+./scripts/test_minio_stream.sh ./source.bin ./downloaded.bin
+```
+
+The proof reads fixed-size chunks from the source, uploads them, and writes each confirmed
+chunk from MinIO to a temporary output. It compares the source, streamed output, and completed
+object with SHA-256 before creating the requested output path. The script rejects empty files,
+files over 8 MiB, symbolic links, and an existing output path.
+
+The command prints a MinIO-confirmed byte count after every chunk. The first chunk also prints a
+live-read message before later source bytes upload.

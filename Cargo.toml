@@ -8,3 +8,21 @@ clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 open = "5"
+
+[features]
+minio-integration = []
+
+[dev-dependencies]
+bytes = "=1.11.1"
+object_store = { version = "=0.14.1", features = ["aws"] }
+sha2 = "=0.11.1"
+store-stream = {
+    git = "https://github.com/wavey-ai/store-stream",
+    rev = "b076ce0743e9dc217517a5b1cedcf05059322183",
+}
+tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+
+[[test]]
+name = "minio_stream"
+path = "tests/minio_stream.rs"
+required-features = ["minio-integration"]
