@@ -7,7 +7,43 @@ A cloud filesystem that's infinitely scalable for humans and agents alike.
 - sync files to s3 (works locally as well) & pull from s3 using cli commands -> tui untested for this
 - basic files like text, md, and other code files work and sync flawlessly.
 - audio and videos sync but wait for uploading/downloading -> solving this is on the roadmap next
-
+ 
+ ## Upload a directory to S3
+ 
+ Set standard AWS environment variables and choose a bucket:
+ 
+ ```bash
+ export AWS_ACCESS_KEY_ID=...
+ export AWS_SECRET_ACCESS_KEY=...
+ export AWS_DEFAULT_REGION=us-east-1
+ export INFINITEFS_S3_BUCKET=your-bucket
+ ```
+ 
+-Upload a project:
++For local development, put the same variables in `.env.local` at the repository root instead.
++InfiniteFS loads that file only when it starts a sync. `.env.local` is ignored by Git, and values
++already exported in your shell take precedence.
++
++Watch a project:
+ 
+ ```bash
+-cargo run --release -- sync /path/to/project
++cargo run --release -- sync --watch /path/to/project
+ ```
+ 
+-The command uploads all regular files recursively. It stores chunks and a manifest below
+-`v1/files/` in the bucket. It reads and writes raw bytes, so file contents and extensions do not
+-change the upload behavior. It rejects symbolic links and stops if a file changes during upload.
++The command uploads all regular files recursively at startup, then watches for changes. It stores
++chunks and a manifest below `v1/files/` in the bucket. It reads and writes raw bytes, so file
++contents and extensions do not change the upload behavior. It skips symbolic links and ignores
++common editor temporary files, and publishes a deleted manifest when a watched file disappears.
+ 
+-This command uploads the directory once. It does not watch for later changes, download files, or
+-resolve conflicts yet.
++Omit `--watch` to upload the directory once. Downloading files and resolving conflicts are not
++implemented yet.
+ 
 ## Requirements
 
 The storage directory defaults to a per-user application data directory and can be overridden with the `INFINITE_STORAGE_DATA` environment variable.

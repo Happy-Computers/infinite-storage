@@ -24,10 +24,11 @@
 
 ## Current uploader
 
-`infinitefs sync <directory>` is a one-way, recursive uploader. It reads every regular file in
-1 MiB chunks and writes each chunk before it advances the manifest. The command uses
-`INFINITEFS_S3_BUCKET` and standard AWS environment variables. It does not watch, download, or
-resolve conflicts.
+`infinitefs sync --watch <directory>` is a one-way, recursive uploader. It scans existing regular
+files, then debounces filesystem events and rechecks the tree after an event overflow. It reads
+every file in 1 MiB chunks and writes each chunk before it advances the manifest. The command uses
+`INFINITEFS_S3_BUCKET` and standard AWS environment variables. It does not download or resolve
+conflicts.
 
 The current key layout is:
 

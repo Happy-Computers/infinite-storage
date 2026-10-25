@@ -6,7 +6,10 @@ edition = "2024"
 [dependencies]
 bytes = "1"
 crossterm = "0.29.0"
+dotenvy = "0.15"
 object_store = { version = "0.14.2", features = ["aws"] }
+notify = "8.2.0"
+notify-debouncer-full = "0.6.0"
 ratatui = "0.30.2"
 open = "5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -9,8 +9,8 @@ mod vpath;
 use std::{env, ffi::OsString, fs, path::PathBuf, process::ExitCode};
 
 fn main() -> ExitCode {
-    match sync_directory() {
-        Ok(Some(directory)) => return run_sync(directory),
+    match sync_command() {
+        Ok(Some(command)) => return run_sync(command),
         Ok(None) => {}
         Err(error) => {
             eprintln!("{error}");
@@ -39,30 +39,40 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn sync_directory() -> Result<Option<PathBuf>, &'static str> {
-    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
-    parse_sync_arguments(&arguments)
+struct SyncCommand {
+    directory: PathBuf,
+    watch: bool,
 }
 
-fn parse_sync_arguments(arguments: &[OsString]) -> Result<Option<PathBuf>, &'static str> {
+fn sync_command() -> Result<Option<SyncCommand>, &'static str> {
+    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    parse_sync_command(&arguments)
+}
+
+fn parse_sync_command(arguments: &[OsString]) -> Result<Option<SyncCommand>, &'static str> {
     let Some(command) = arguments.first() else {
         return Ok(None);
     };
     if command != "sync" {
-        return Err("Usage: infinitefs sync <directory>");
+        return Err("Usage: infinitefs sync [--watch] <directory>");
     }
 
+    let (watch, directory_index) = if arguments.get(1).is_some_and(|value| value == "--watch") {
+        (true, 2)
+    } else {
+        (false, 1)
+    };
     let directory = arguments
-        .get(1)
+        .get(directory_index)
         .map(PathBuf::from)
-        .ok_or("Usage: infinitefs sync <directory>")?;
-    if arguments.len() != 2 {
-        return Err("Usage: infinitefs sync <directory>");
+        .ok_or("Usage: infinitefs sync [--watch] <directory>")?;
+    if arguments.len() != directory_index + 1 {
+        return Err("Usage: infinitefs sync [--watch] <directory>");
     }
-    Ok(Some(directory))
+    Ok(Some(SyncCommand { directory, watch }))
 }
 
-fn run_sync(directory: PathBuf) -> ExitCode {
+fn run_sync(command: SyncCommand) -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -71,13 +81,13 @@ fn run_sync(directory: PathBuf) -> ExitCode {
         }
     };
 
-    match runtime.block_on(sync::run(&directory)) {
+    match runtime.block_on(sync::run(&command.directory, command.watch)) {
         Ok(file_count) => {
             println!("Synced {file_count} files.");
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("Could not sync {}: {error}", directory.display());
+            eprintln!("Could not sync {}: {error}", command.directory.display());
             ExitCode::FAILURE
         }
     }
@@ -89,12 +99,21 @@ mod tests {
 
     #[test]
     fn sync_command_requires_one_directory() {
-        assert_eq!(parse_sync_arguments(&[]), Ok(None));
-        assert_eq!(
-            parse_sync_arguments(&[OsString::from("sync"), OsString::from("project")]),
-            Ok(Some(PathBuf::from("project")))
-        );
-        assert!(parse_sync_arguments(&[OsString::from("sync")]).is_err());
-        assert!(parse_sync_arguments(&[OsString::from("other")]).is_err());
+        assert!(parse_sync_command(&[]).unwrap().is_none());
+        let command = parse_sync_command(&[OsString::from("sync"), OsString::from("project")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.directory, PathBuf::from("project"));
+        assert!(!command.watch);
+        let command = parse_sync_command(&[
+            OsString::from("sync"),
+            OsString::from("--watch"),
+            OsString::from("project"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(command.watch);
+        assert!(parse_sync_command(&[OsString::from("sync")]).is_err());
+        assert!(parse_sync_command(&[OsString::from("other")]).is_err());
     }
 }

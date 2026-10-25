@@ -1,34 +1,213 @@
 use bytes::Bytes;
+use notify::{Config, RecursiveMode};
+use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
 use std::{
+    collections::HashMap,
     env, fmt, fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError, TrySendError},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 const CHUNK_SIZE: usize = 1024 * 1024;
+const DEBOUNCE_DURATION: Duration = Duration::from_millis(200);
+const EVENT_BATCH_CAPACITY: usize = 32;
+const EVENT_PATH_LIMIT: usize = 4096;
 const MAX_FILE_COUNT: u32 = 1_000_000;
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 const STORAGE_PREFIX: &str = "v1/files";
 
-pub async fn run(directory: &Path) -> Result<u32, Error> {
+pub async fn run(directory: &Path, watch: bool) -> Result<u32, Error> {
+    load_local_environment()?;
     let source = canonical_source(directory)?;
     let bucket = required_environment("INFINITEFS_S3_BUCKET")?;
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .build()?;
 
-    sync_directory(&store, &source).await
+    if watch {
+        watch_directory(&store, source).await
+    } else {
+        let mut index = SyncIndex::new();
+        index.rescan(&store, &source).await?;
+        Ok(index.file_count())
+    }
 }
 
-async fn sync_directory(store: &dyn ObjectStore, source: &Path) -> Result<u32, Error> {
-    let files = regular_files(source)?;
-    let file_count = u32::try_from(files.len()).map_err(|_| Error::TooManyFiles)?;
+fn load_local_environment() -> Result<(), Error> {
+    match dotenvy::from_filename(".env.local") {
+        Ok(_) => Ok(()),
+        Err(dotenvy::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Dotenv(error)),
+    }
+}
 
-    for file in files {
-        upload_file(store, source, &file).await?;
+async fn watch_directory(store: &dyn ObjectStore, source: PathBuf) -> Result<u32, Error> {
+    let (sender, receiver) = mpsc::sync_channel(EVENT_BATCH_CAPACITY);
+    let rescan_requested = Arc::new(AtomicBool::new(false));
+    let _debouncer = create_watcher(&source, sender, Arc::clone(&rescan_requested))?;
+    let mut index = SyncIndex::new();
+    index.rescan(store, &source).await?;
+    let mut rescan_at = Instant::now() + RESCAN_INTERVAL;
+
+    loop {
+        if rescan_requested.swap(false, Ordering::AcqRel) || Instant::now() >= rescan_at {
+            index.rescan(store, &source).await?;
+            rescan_at = Instant::now() + RESCAN_INTERVAL;
+        }
+
+        match receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(paths) => index.apply_paths(store, &source, paths).await?,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(Error::WatcherStopped),
+        }
+    }
+}
+
+fn create_watcher(
+    source: &Path,
+    sender: mpsc::SyncSender<Vec<PathBuf>>,
+    rescan_requested: Arc<AtomicBool>,
+) -> Result<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>, Error> {
+    let callback = move |result: DebounceEventResult| {
+        let paths = match result {
+            Ok(events) => event_paths(events, &rescan_requested),
+            Err(_) => {
+                rescan_requested.store(true, Ordering::Release);
+                return;
+            }
+        };
+        if paths.is_empty() {
+            return;
+        }
+        match sender.try_send(paths) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => rescan_requested.store(true, Ordering::Release),
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    };
+    let mut debouncer = new_debouncer_opt(
+        DEBOUNCE_DURATION,
+        Some(DEBOUNCE_DURATION / 2),
+        callback,
+        NoCache::new(),
+        Config::default().with_follow_symlinks(false),
+    )?;
+    debouncer.watch(source, RecursiveMode::Recursive)?;
+    Ok(debouncer)
+}
+
+fn event_paths(
+    events: Vec<notify_debouncer_full::DebouncedEvent>,
+    rescan_requested: &AtomicBool,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for event in events {
+        if event.event.need_rescan() {
+            rescan_requested.store(true, Ordering::Release);
+        }
+        paths.extend(event.event.paths);
+        if paths.len() > EVENT_PATH_LIMIT {
+            rescan_requested.store(true, Ordering::Release);
+            return Vec::new();
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+struct SyncIndex {
+    files: HashMap<PathBuf, FileSnapshot>,
+}
+
+impl SyncIndex {
+    fn new() -> Self {
+        Self {
+            files: HashMap::new(),
+        }
     }
 
-    Ok(file_count)
+    fn file_count(&self) -> u32 {
+        u32::try_from(self.files.len()).expect("file count is bounded")
+    }
+
+    async fn rescan(&mut self, store: &dyn ObjectStore, source: &Path) -> Result<(), Error> {
+        let current = regular_files(source)?;
+        let mut seen = HashMap::new();
+
+        for path in current {
+            let snapshot = match file_snapshot(&path) {
+                Ok(snapshot) => snapshot,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if self.files.get(&path) != Some(&snapshot) {
+                match upload_file(store, source, &path).await {
+                    Ok(()) => {
+                        seen.insert(path, snapshot);
+                    }
+                    Err(Error::ChangedDuringUpload(_)) => {
+                        if let Some(previous) = self.files.get(&path) {
+                            seen.insert(path, previous.clone());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                seen.insert(path, snapshot);
+            }
+        }
+
+        for path in self.files.keys() {
+            if !seen.contains_key(path) {
+                put_tombstone(store, source, path).await?;
+            }
+        }
+
+        self.files = seen;
+        Ok(())
+    }
+
+    async fn apply_paths(
+        &mut self,
+        store: &dyn ObjectStore,
+        source: &Path,
+        paths: Vec<PathBuf>,
+    ) -> Result<(), Error> {
+        for path in paths {
+            if !path.starts_with(source) || temporary_path(&path) {
+                continue;
+            }
+            if path.is_dir() {
+                self.rescan(store, source).await?;
+            } else if path.is_file() {
+                match file_snapshot(&path) {
+                    Ok(snapshot) => {
+                        if self.files.get(&path) == Some(&snapshot) {
+                            continue;
+                        }
+                        if upload_file(store, source, &path).await.is_ok() {
+                            self.files.insert(path, snapshot);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        self.rescan(store, source).await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                self.rescan(store, source).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn upload_file(
@@ -36,9 +215,7 @@ async fn upload_file(
     source: &Path,
     file_path: &Path,
 ) -> Result<(), Error> {
-    let relative = file_path
-        .strip_prefix(source)
-        .map_err(|_| Error::InvalidPath(file_path.to_owned()))?;
+    let relative = relative_path(source, file_path)?;
     let prefix = object_prefix(relative)?;
     let manifest_path = prefix.clone().join("manifest");
     let snapshot_before = file_snapshot(file_path)?;
@@ -77,6 +254,12 @@ async fn upload_file(
     put_manifest(store, &manifest_path, confirmed_size, "complete").await?;
     println!("Synced {} ({confirmed_size} bytes).", relative.display());
     Ok(())
+}
+
+async fn put_tombstone(store: &dyn ObjectStore, source: &Path, path: &Path) -> Result<(), Error> {
+    let relative = relative_path(source, path)?;
+    let manifest_path = object_prefix(relative)?.join("manifest");
+    put_manifest(store, &manifest_path, 0, "deleted").await
 }
 
 async fn put_manifest(
@@ -120,18 +303,30 @@ fn regular_files(source: &Path) -> Result<Vec<PathBuf>, Error> {
             if file_type.is_dir() {
                 directories.push(path);
             } else if file_type.is_file() {
-                files.push(path);
+                if !temporary_path(&path) {
+                    files.push(path);
+                }
                 if files.len() > MAX_FILE_COUNT as usize {
                     return Err(Error::TooManyFiles);
                 }
-            } else if file_type.is_symlink() {
-                return Err(Error::SymbolicLink(path));
             }
         }
     }
 
     files.sort();
     Ok(files)
+}
+
+fn temporary_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with(".#") || name.ends_with('~') || name.ends_with(".swp")
+}
+
+fn relative_path<'a>(source: &Path, path: &'a Path) -> Result<&'a Path, Error> {
+    path.strip_prefix(source)
+        .map_err(|_| Error::InvalidPath(path.to_owned()))
 }
 
 fn object_prefix(relative: &Path) -> Result<ObjectPath, Error> {
@@ -153,10 +348,10 @@ fn read_chunk(reader: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FileSnapshot {
     length: u64,
-    modified: std::time::SystemTime,
+    modified: SystemTime,
 }
 
 fn file_snapshot(path: &Path) -> io::Result<FileSnapshot> {
@@ -170,14 +365,16 @@ fn file_snapshot(path: &Path) -> io::Result<FileSnapshot> {
 #[derive(Debug)]
 pub enum Error {
     ChangedDuringUpload(PathBuf),
+    Dotenv(dotenvy::Error),
     InvalidPath(PathBuf),
     Io(io::Error),
     MissingEnvironment(String),
     NonUtf8Path(PathBuf),
     NotDirectory(PathBuf),
     Store(object_store::Error),
-    SymbolicLink(PathBuf),
     TooManyFiles,
+    Watcher(notify::Error),
+    WatcherStopped,
 }
 
 impl fmt::Display for Error {
@@ -186,6 +383,7 @@ impl fmt::Display for Error {
             Self::ChangedDuringUpload(path) => {
                 write!(formatter, "{} changed during upload", path.display())
             }
+            Self::Dotenv(error) => error.fmt(formatter),
             Self::InvalidPath(path) => {
                 write!(formatter, "{} is outside the source", path.display())
             }
@@ -194,12 +392,9 @@ impl fmt::Display for Error {
             Self::NonUtf8Path(path) => write!(formatter, "{} is not UTF-8", path.display()),
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
             Self::Store(error) => error.fmt(formatter),
-            Self::SymbolicLink(path) => write!(
-                formatter,
-                "symbolic links are not supported: {}",
-                path.display()
-            ),
             Self::TooManyFiles => write!(formatter, "source has more than {MAX_FILE_COUNT} files"),
+            Self::Watcher(error) => error.fmt(formatter),
+            Self::WatcherStopped => write!(formatter, "file watcher stopped"),
         }
     }
 }
@@ -218,6 +413,12 @@ impl From<object_store::Error> for Error {
     }
 }
 
+impl From<notify::Error> for Error {
+    fn from(error: notify::Error) -> Self {
+        Self::Watcher(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,10 +434,10 @@ mod tests {
             let count = COUNTER.fetch_add(1, Ordering::Relaxed);
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("system time should be after the Unix epoch")
+                .unwrap()
                 .as_nanos();
             let path = env::temp_dir().join(format!("infinitefs-sync-{timestamp}-{count}"));
-            fs::create_dir_all(&path).expect("test directory should be created");
+            fs::create_dir_all(&path).unwrap();
             Self(path)
         }
     }
@@ -247,53 +448,72 @@ mod tests {
         }
     }
 
+    async fn manifest(store: &InMemory, relative: &str) -> String {
+        let path = object_prefix(Path::new(relative)).unwrap().join("manifest");
+        let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
     #[tokio::test]
-    async fn uploads_chunks_and_a_complete_manifest() {
+    async fn rescan_uploads_changes_and_tombstones_deletions() {
         let source = TestDirectory::new();
         let file = source.0.join("project/package.json");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, vec![42; CHUNK_SIZE + 1]).unwrap();
         let store = InMemory::new();
+        let mut index = SyncIndex::new();
 
-        assert_eq!(sync_directory(&store, &source.0).await.unwrap(), 1);
-
-        let prefix = object_prefix(Path::new("project/package.json")).unwrap();
-        assert_eq!(prefix.as_ref(), "v1/files/project%2Fpackage.json");
-        let manifest = store
-            .get(&prefix.clone().join("manifest"))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        index.rescan(&store, &source.0).await.unwrap();
         assert_eq!(
-            std::str::from_utf8(&manifest).unwrap(),
+            manifest(&store, "project/package.json").await,
             format!(
                 "version=1\nsize={}\nchunk_size={CHUNK_SIZE}\nstate=complete\n",
                 CHUNK_SIZE + 1
             )
         );
+
+        fs::remove_file(&file).unwrap();
+        index.rescan(&store, &source.0).await.unwrap();
         assert_eq!(
-            store
-                .get(&prefix.clone().join("chunks").join("00000000"))
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap()
-                .len(),
-            CHUNK_SIZE
+            manifest(&store, "project/package.json").await,
+            format!("version=1\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
         );
-        assert_eq!(
-            store
-                .get(&prefix.join("chunks").join("00000001"))
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+    }
+
+    #[test]
+    fn skips_editor_temporary_files() {
+        assert!(temporary_path(Path::new("notes.swp")));
+        assert!(temporary_path(Path::new("draft~")));
+        assert!(temporary_path(Path::new(".#draft")));
+        assert!(!temporary_path(Path::new("package.json")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let source = TestDirectory::new();
+        let file = source.0.join("package.json");
+        let link = source.0.join("node_modules/.bin/tool");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        fs::write(&file, "{}").unwrap();
+        symlink(&file, &link).unwrap();
+
+        assert_eq!(regular_files(&source.0).unwrap(), vec![file]);
+    }
+
+    #[test]
+    fn watcher_emits_a_created_file() {
+        let source = TestDirectory::new();
+        let (sender, receiver) = mpsc::sync_channel(EVENT_BATCH_CAPACITY);
+        let rescan_requested = Arc::new(AtomicBool::new(false));
+        let _watcher = create_watcher(&source.0, sender, rescan_requested).unwrap();
+        let file = source.0.join("created.txt");
+
+        fs::write(&file, "created").unwrap();
+
+        let paths = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(paths.contains(&file));
     }
 }
