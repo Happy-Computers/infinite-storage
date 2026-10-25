@@ -38,8 +38,9 @@ The current key layout is:
 <synced-root>/<relative-file-path>/chunks/00000001
 ```
 
-The manifest contains the number of confirmed bytes, the fixed chunk size, and `uploading` or
-`complete`. A future reader can use it to fetch only chunks that have been published.
+The manifest contains the number of confirmed bytes, the fixed chunk size, and `uploading`,
+`complete`, or `deleted`. `infinitefs pull <root> <directory>` restores complete manifests by
+streaming chunks into a temporary file and then renaming the verified file into place.
 
 ## The hard constraint
 

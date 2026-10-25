@@ -7,6 +7,8 @@ edition = "2024"
 bytes = "1"
 crossterm = "0.29.0"
 dotenvy = "0.15"
+futures-util = "0.3"
+percent-encoding = "2"
 object_store = { version = "0.14.2", features = ["aws"] }
 notify = "8.2.0"
 notify-debouncer-full = "0.6.0"

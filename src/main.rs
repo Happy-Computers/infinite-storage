@@ -9,8 +9,9 @@ mod vpath;
 use std::{env, ffi::OsString, fs, path::PathBuf, process::ExitCode};
 
 fn main() -> ExitCode {
-    match sync_command() {
-        Ok(Some(command)) => return run_sync(command),
+    match command() {
+        Ok(Some(Command::Pull(command))) => return run_pull(command),
+        Ok(Some(Command::Sync(command))) => return run_sync(command),
         Ok(None) => {}
         Err(error) => {
             eprintln!("{error}");
@@ -39,24 +40,55 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+enum Command {
+    Pull(PullCommand),
+    Sync(SyncCommand),
+}
+
+struct PullCommand {
+    destination: PathBuf,
+    root: String,
+}
+
 struct SyncCommand {
     directory: PathBuf,
     watch: bool,
 }
 
-fn sync_command() -> Result<Option<SyncCommand>, &'static str> {
+fn command() -> Result<Option<Command>, &'static str> {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
-    parse_sync_command(&arguments)
+    parse_command(&arguments)
 }
 
-fn parse_sync_command(arguments: &[OsString]) -> Result<Option<SyncCommand>, &'static str> {
+fn parse_command(arguments: &[OsString]) -> Result<Option<Command>, &'static str> {
     let Some(command) = arguments.first() else {
         return Ok(None);
     };
-    if command != "sync" {
-        return Err("Usage: infinitefs sync [--watch] <directory>");
-    }
 
+    match command.to_str() {
+        Some("pull") => parse_pull(arguments).map(Some),
+        Some("sync") => parse_sync(arguments).map(Some),
+        _ => Err(
+            "Usage: infinitefs sync [--watch] <directory>\n       infinitefs pull <s3-root> <directory>",
+        ),
+    }
+}
+
+fn parse_pull(arguments: &[OsString]) -> Result<Command, &'static str> {
+    if arguments.len() != 3 {
+        return Err("Usage: infinitefs pull <s3-root> <directory>");
+    }
+    let root = arguments[1]
+        .to_str()
+        .filter(|root| !root.is_empty())
+        .ok_or("The S3 root must be UTF-8")?;
+    Ok(Command::Pull(PullCommand {
+        root: root.to_owned(),
+        destination: PathBuf::from(&arguments[2]),
+    }))
+}
+
+fn parse_sync(arguments: &[OsString]) -> Result<Command, &'static str> {
     let (watch, directory_index) = if arguments.get(1).is_some_and(|value| value == "--watch") {
         (true, 2)
     } else {
@@ -69,7 +101,28 @@ fn parse_sync_command(arguments: &[OsString]) -> Result<Option<SyncCommand>, &'s
     if arguments.len() != directory_index + 1 {
         return Err("Usage: infinitefs sync [--watch] <directory>");
     }
-    Ok(Some(SyncCommand { directory, watch }))
+    Ok(Command::Sync(SyncCommand { directory, watch }))
+}
+
+fn run_pull(command: PullCommand) -> ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Could not start the pull runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(sync::pull(&command.root, &command.destination)) {
+        Ok(file_count) => {
+            println!("Pulled {file_count} files.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Could not pull {}: {error}", command.root);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_sync(command: SyncCommand) -> ExitCode {
@@ -98,22 +151,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_command_requires_one_directory() {
-        assert!(parse_sync_command(&[]).unwrap().is_none());
-        let command = parse_sync_command(&[OsString::from("sync"), OsString::from("project")])
-            .unwrap()
-            .unwrap();
-        assert_eq!(command.directory, PathBuf::from("project"));
-        assert!(!command.watch);
-        let command = parse_sync_command(&[
+    fn parses_pull_and_sync_commands() {
+        assert!(parse_command(&[]).unwrap().is_none());
+        let Command::Sync(command) = parse_command(&[
             OsString::from("sync"),
             OsString::from("--watch"),
             OsString::from("project"),
         ])
         .unwrap()
-        .unwrap();
+        .unwrap() else {
+            panic!("expected sync command");
+        };
+        assert_eq!(command.directory, PathBuf::from("project"));
         assert!(command.watch);
-        assert!(parse_sync_command(&[OsString::from("sync")]).is_err());
-        assert!(parse_sync_command(&[OsString::from("other")]).is_err());
+
+        let Command::Pull(command) = parse_command(&[
+            OsString::from("pull"),
+            OsString::from("project"),
+            OsString::from("output"),
+        ])
+        .unwrap()
+        .unwrap() else {
+            panic!("expected pull command");
+        };
+        assert_eq!(command.root, "project");
+        assert_eq!(command.destination, PathBuf::from("output"));
     }
 }

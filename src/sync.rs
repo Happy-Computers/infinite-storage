@@ -1,7 +1,9 @@
 use bytes::Bytes;
+use futures_util::StreamExt;
 use notify::{Config, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
+use percent_encoding::percent_decode_str;
 use std::{
     collections::HashMap,
     env, fmt, fs,
@@ -45,6 +47,217 @@ fn load_local_environment() -> Result<(), Error> {
         Err(dotenvy::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(Error::Dotenv(error)),
     }
+}
+
+pub async fn pull(root: &str, destination: &Path) -> Result<u32, Error> {
+    load_local_environment()?;
+    let bucket = required_environment("INFINITEFS_S3_BUCKET")?;
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .build()?;
+    pull_directory(&store, root, destination).await
+}
+
+async fn pull_directory(
+    store: &dyn ObjectStore,
+    root: &str,
+    destination: &Path,
+) -> Result<u32, Error> {
+    let prefix = ObjectPath::from(root);
+    let mut objects = store.list(Some(&prefix));
+    let mut file_count = 0u32;
+
+    while let Some(object) = objects.next().await {
+        let object = object?;
+        if object.location.filename() != Some("manifest") {
+            continue;
+        }
+        let bytes = store.get(&object.location).await?.bytes().await?;
+        let manifest = Manifest::parse(&bytes)?;
+        let relative = manifest_relative(&prefix, &object.location)?;
+
+        match manifest.state {
+            ManifestState::Complete => {
+                pull_file(store, &object.location, &manifest, destination, &relative).await?;
+                file_count += 1;
+            }
+            ManifestState::Deleted => pull_deleted(destination, &relative)?,
+            ManifestState::Uploading => {}
+        }
+    }
+
+    Ok(file_count)
+}
+
+async fn pull_file(
+    store: &dyn ObjectStore,
+    manifest_path: &ObjectPath,
+    manifest: &Manifest,
+    destination_root: &Path,
+    relative: &Path,
+) -> Result<(), Error> {
+    let destination = destination_root.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::InvalidPath(destination.clone()))?;
+    fs::create_dir_all(parent)?;
+    reject_symbolic_link(&destination)?;
+
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| Error::InvalidPath(destination.clone()))?;
+    let partial = parent.join(format!(
+        "{}.infinitefs-partial",
+        file_name.to_string_lossy()
+    ));
+    let mut output = fs::File::create(&partial)?;
+    let chunks = manifest.chunk_count()?;
+    let prefix = manifest_path
+        .parent()
+        .ok_or_else(|| Error::InvalidRemotePath(manifest_path.to_string()))?;
+    let mut written = 0u64;
+
+    for index in 0..chunks {
+        let path = prefix.clone().join("chunks").join(format!("{index:08}"));
+        let bytes = store.get(&path).await?.bytes().await?;
+        let expected = manifest.chunk_size.min(manifest.size - written);
+        let length = u64::try_from(bytes.len()).map_err(|_| Error::ChunkTooLarge)?;
+        if length != expected {
+            return Err(Error::InvalidChunk(path.to_string()));
+        }
+        use std::io::Write;
+        output.write_all(&bytes)?;
+        written += length;
+    }
+
+    if written != manifest.size {
+        return Err(Error::InvalidManifest("chunk sizes do not match file size"));
+    }
+    output.sync_all()?;
+    fs::rename(partial, destination)?;
+    Ok(())
+}
+
+fn pull_deleted(destination_root: &Path, relative: &Path) -> Result<(), Error> {
+    let destination = destination_root.join(relative);
+    if destination.exists() {
+        reject_symbolic_link(&destination)?;
+        fs::remove_file(destination)?;
+    }
+    Ok(())
+}
+
+fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(Error::SymbolicLink(path.to_owned()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[derive(Debug)]
+struct Manifest {
+    chunk_size: u64,
+    size: u64,
+    state: ManifestState,
+}
+
+impl Manifest {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| Error::InvalidManifest("manifest is not UTF-8"))?;
+        let mut chunk_size = None;
+        let mut size = None;
+        let mut state = None;
+
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "chunk_size" => chunk_size = Some(parse_manifest_number(value)?),
+                "size" => size = Some(parse_manifest_number(value)?),
+                "state" => state = Some(ManifestState::parse(value)?),
+                _ => {}
+            }
+        }
+
+        let chunk_size =
+            chunk_size.ok_or(Error::InvalidManifest("manifest is missing chunk_size"))?;
+        if chunk_size != CHUNK_SIZE as u64 {
+            return Err(Error::InvalidManifest("manifest chunk_size is unsupported"));
+        }
+        Ok(Self {
+            chunk_size,
+            size: size.ok_or(Error::InvalidManifest("manifest is missing size"))?,
+            state: state.ok_or(Error::InvalidManifest("manifest is missing state"))?,
+        })
+    }
+
+    fn chunk_count(&self) -> Result<u64, Error> {
+        let adjusted = self
+            .size
+            .checked_add(self.chunk_size - 1)
+            .ok_or(Error::ChunkTooLarge)?;
+        Ok(adjusted / self.chunk_size)
+    }
+}
+
+#[derive(Debug)]
+enum ManifestState {
+    Complete,
+    Deleted,
+    Uploading,
+}
+
+impl ManifestState {
+    fn parse(value: &str) -> Result<Self, Error> {
+        match value {
+            "complete" => Ok(Self::Complete),
+            "deleted" => Ok(Self::Deleted),
+            "uploading" => Ok(Self::Uploading),
+            _ => Err(Error::InvalidManifest("manifest state is invalid")),
+        }
+    }
+}
+
+fn manifest_relative(prefix: &ObjectPath, manifest: &ObjectPath) -> Result<PathBuf, Error> {
+    let manifest_parent = manifest
+        .parent()
+        .ok_or_else(|| Error::InvalidRemotePath(manifest.to_string()))?;
+    let parts = manifest_parent
+        .prefix_match(prefix)
+        .ok_or_else(|| Error::InvalidRemotePath(manifest.to_string()))?;
+    let mut relative = PathBuf::new();
+
+    for part in parts {
+        let part = percent_decode_str(part.as_ref())
+            .decode_utf8()
+            .map_err(|_| Error::InvalidRemotePath(manifest.to_string()))?;
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains('/')
+            || part.contains('\\')
+        {
+            return Err(Error::InvalidRemotePath(manifest.to_string()));
+        }
+        relative.push(part.as_ref());
+    }
+
+    if relative.as_os_str().is_empty() {
+        return Err(Error::InvalidRemotePath(manifest.to_string()));
+    }
+    Ok(relative)
+}
+
+fn parse_manifest_number(value: &str) -> Result<u64, Error> {
+    value
+        .parse()
+        .map_err(|_| Error::InvalidManifest("manifest number is invalid"))
 }
 
 async fn watch_directory(store: &dyn ObjectStore, source: PathBuf) -> Result<u32, Error> {
@@ -377,13 +590,18 @@ fn file_snapshot(path: &Path) -> io::Result<FileSnapshot> {
 #[derive(Debug)]
 pub enum Error {
     ChangedDuringUpload(PathBuf),
+    ChunkTooLarge,
     Dotenv(dotenvy::Error),
+    InvalidChunk(String),
+    InvalidManifest(&'static str),
     InvalidPath(PathBuf),
+    InvalidRemotePath(String),
     Io(io::Error),
     MissingEnvironment(String),
     NonUtf8Path(PathBuf),
     NotDirectory(PathBuf),
     Store(object_store::Error),
+    SymbolicLink(PathBuf),
     TooManyFiles,
     Watcher(notify::Error),
     WatcherStopped,
@@ -395,15 +613,22 @@ impl fmt::Display for Error {
             Self::ChangedDuringUpload(path) => {
                 write!(formatter, "{} changed during upload", path.display())
             }
+            Self::ChunkTooLarge => write!(formatter, "chunk count is too large"),
             Self::Dotenv(error) => error.fmt(formatter),
+            Self::InvalidChunk(path) => write!(formatter, "invalid chunk: {path}"),
+            Self::InvalidManifest(message) => write!(formatter, "invalid manifest: {message}"),
             Self::InvalidPath(path) => {
                 write!(formatter, "{} is outside the source", path.display())
             }
+            Self::InvalidRemotePath(path) => write!(formatter, "invalid remote path: {path}"),
             Self::Io(error) => error.fmt(formatter),
             Self::MissingEnvironment(name) => write!(formatter, "set {name}"),
             Self::NonUtf8Path(path) => write!(formatter, "{} is not UTF-8", path.display()),
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
             Self::Store(error) => error.fmt(formatter),
+            Self::SymbolicLink(path) => {
+                write!(formatter, "refusing symbolic link: {}", path.display())
+            }
             Self::TooManyFiles => write!(formatter, "source has more than {MAX_FILE_COUNT} files"),
             Self::Watcher(error) => error.fmt(formatter),
             Self::WatcherStopped => write!(formatter, "file watcher stopped"),
@@ -505,6 +730,35 @@ mod tests {
         assert_eq!(
             manifest(&store, &source.0, "project/package.json").await,
             format!("version=1\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn pulls_complete_files_into_a_second_directory() {
+        let source = TestDirectory::new();
+        let file = source.0.join("nested/hello.txt");
+        let contents = b"Hello from InfiniteFS.\n";
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, contents).unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+        index.rescan(&store, &source.0).await.unwrap();
+
+        let destination = TestDirectory::new();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            pull_directory(&store, root, &destination.0).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            fs::read(destination.0.join("nested/hello.txt")).unwrap(),
+            contents
+        );
+        assert!(
+            !destination
+                .0
+                .join("nested/hello.txt.infinitefs-partial")
+                .exists()
         );
     }
 

@@ -1033,10 +1033,12 @@ dependencies = [
  "bytes",
  "crossterm",
  "dotenvy",
+ "futures-util",
  "notify",
  "notify-debouncer-full",
  "object_store",
  "open",
+ "percent-encoding",
  "ratatui",
  "tokio",
 ]
