@@ -20,7 +20,25 @@
   1. **chunk objects + a manifest** (works on any S3 bucket, readers use our client);
   2. **S3 Express One Zone append** (`PutObject` with `x-amz-write-offset-bytes`, visible to any
      S3 reader, but directory buckets only, single writer, 10k appends);
-  3. **a local file plus our app streaming it** (remote readers do not see it until upload ends).
+   3. **a local file plus our app streaming it** (remote readers do not see it until upload ends).
+
+## Current uploader
+
+`infinitefs sync <directory>` is a one-way, recursive uploader. It reads every regular file in
+1 MiB chunks and writes each chunk before it advances the manifest. The command uses
+`INFINITEFS_S3_BUCKET` and standard AWS environment variables. It does not watch, download, or
+resolve conflicts.
+
+The current key layout is:
+
+```
+v1/files/<encoded-relative-file-path>/manifest
+v1/files/<encoded-relative-file-path>/chunks/00000000
+v1/files/<encoded-relative-file-path>/chunks/00000001
+```
+
+The manifest contains the number of confirmed bytes, the fixed chunk size, and `uploading` or
+`complete`. A future reader can use it to fetch only chunks that have been published.
 
 ## The hard constraint
 

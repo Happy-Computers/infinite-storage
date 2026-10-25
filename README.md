@@ -8,7 +8,6 @@ A cloud filesystem that's infinitely scalable for humans and agents alike.
 - basic files like text, md, and other code files work and sync flawlessly.
 - audio and videos sync but wait for uploading/downloading -> solving this is on the roadmap next
 
-
 ## Requirements
 
 The storage directory defaults to a per-user application data directory and can be overridden with the `INFINITE_STORAGE_DATA` environment variable.
@@ -39,4 +38,3 @@ INFINITE_STORAGE_DATA=/var/lib/infinite-storage cargo run
 Keep test files and development data separate from important personal files.
 
 The local browser is not a mounted cloud filesystem. S3 integration and cloud-backed access are planned.
-
