@@ -33,9 +33,9 @@ conflicts.
 The current key layout is:
 
 ```
-v1/files/<encoded-relative-file-path>/manifest
-v1/files/<encoded-relative-file-path>/chunks/00000000
-v1/files/<encoded-relative-file-path>/chunks/00000001
+<synced-root>/<relative-file-path>/manifest
+<synced-root>/<relative-file-path>/chunks/00000000
+<synced-root>/<relative-file-path>/chunks/00000001
 ```
 
 The manifest contains the number of confirmed bytes, the fixed chunk size, and `uploading` or
@@ -108,9 +108,9 @@ That means "the user sees the file after a few bytes" has to be defined:
 ### Data layout
 
 ```
-v1/files/<url-encoded path>/<version>/manifest.json
-v1/files/<url-encoded path>/<version>/00000000
-v1/files/<url-encoded path>/<version>/00000001
+<synced-root>/<relative-file-path>/<version>/manifest.json
+<synced-root>/<relative-file-path>/<version>/00000000
+<synced-root>/<relative-file-path>/<version>/00000001
 ```
 
 Manifest example JSON:
@@ -146,7 +146,7 @@ becomes `"complete"` and `size` is final.
    `files/<path>` key. Do this only when someone needs it; it costs one server-side copy.
 4. Rename = write a new manifest and tombstone the old one. Delete = tombstone. Chunks are
    immutable and garbage-collected by a background sweep. Never rewrite a chunk.
-5. Prefix every object with a schema version, e.g. `v1/files/...`, so the layout can change.
+5. Keep each synced root in its own top-level S3 prefix.
 
 ### Reader path
 

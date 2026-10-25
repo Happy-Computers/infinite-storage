@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     env, fmt, fs,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,7 +21,6 @@ const EVENT_BATCH_CAPACITY: usize = 32;
 const EVENT_PATH_LIMIT: usize = 4096;
 const MAX_FILE_COUNT: u32 = 1_000_000;
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
-const STORAGE_PREFIX: &str = "v1/files";
 
 pub async fn run(directory: &Path, watch: bool) -> Result<u32, Error> {
     load_local_environment()?;
@@ -216,7 +215,7 @@ async fn upload_file(
     file_path: &Path,
 ) -> Result<(), Error> {
     let relative = relative_path(source, file_path)?;
-    let prefix = object_prefix(relative)?;
+    let prefix = object_prefix(source, relative)?;
     let manifest_path = prefix.clone().join("manifest");
     let snapshot_before = file_snapshot(file_path)?;
     let mut reader = fs::File::open(file_path)?;
@@ -258,7 +257,7 @@ async fn upload_file(
 
 async fn put_tombstone(store: &dyn ObjectStore, source: &Path, path: &Path) -> Result<(), Error> {
     let relative = relative_path(source, path)?;
-    let manifest_path = object_prefix(relative)?.join("manifest");
+    let manifest_path = object_prefix(source, relative)?.join("manifest");
     put_manifest(store, &manifest_path, 0, "deleted").await
 }
 
@@ -329,11 +328,24 @@ fn relative_path<'a>(source: &Path, path: &'a Path) -> Result<&'a Path, Error> {
         .map_err(|_| Error::InvalidPath(path.to_owned()))
 }
 
-fn object_prefix(relative: &Path) -> Result<ObjectPath, Error> {
-    let path = relative
-        .to_str()
-        .ok_or_else(|| Error::NonUtf8Path(relative.to_owned()))?;
-    Ok(ObjectPath::from(STORAGE_PREFIX).join(path))
+fn object_prefix(source: &Path, relative: &Path) -> Result<ObjectPath, Error> {
+    let root = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::NonUtf8Path(source.to_owned()))?;
+    let mut prefix = ObjectPath::from(root);
+
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(relative.to_owned()));
+        };
+        let component = component
+            .to_str()
+            .ok_or_else(|| Error::NonUtf8Path(relative.to_owned()))?;
+        prefix = prefix.join(component);
+    }
+
+    Ok(prefix)
 }
 
 fn read_chunk(reader: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
@@ -448,8 +460,10 @@ mod tests {
         }
     }
 
-    async fn manifest(store: &InMemory, relative: &str) -> String {
-        let path = object_prefix(Path::new(relative)).unwrap().join("manifest");
+    async fn manifest(store: &InMemory, source: &Path, relative: &str) -> String {
+        let path = object_prefix(source, Path::new(relative))
+            .unwrap()
+            .join("manifest");
         let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
@@ -464,8 +478,15 @@ mod tests {
         let mut index = SyncIndex::new();
 
         index.rescan(&store, &source.0).await.unwrap();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
         assert_eq!(
-            manifest(&store, "project/package.json").await,
+            object_prefix(&source.0, Path::new("project/package.json"))
+                .unwrap()
+                .as_ref(),
+            format!("{root}/project/package.json")
+        );
+        assert_eq!(
+            manifest(&store, &source.0, "project/package.json").await,
             format!(
                 "version=1\nsize={}\nchunk_size={CHUNK_SIZE}\nstate=complete\n",
                 CHUNK_SIZE + 1
@@ -474,8 +495,15 @@ mod tests {
 
         fs::remove_file(&file).unwrap();
         index.rescan(&store, &source.0).await.unwrap();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
         assert_eq!(
-            manifest(&store, "project/package.json").await,
+            object_prefix(&source.0, Path::new("project/package.json"))
+                .unwrap()
+                .as_ref(),
+            format!("{root}/project/package.json")
+        );
+        assert_eq!(
+            manifest(&store, &source.0, "project/package.json").await,
             format!("version=1\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
         );
     }
