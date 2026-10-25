@@ -4,22 +4,10 @@ A cloud filesystem that's infinitely scalable for humans and agents alike.
 
 ## Current features
 
-- CLI commands for version, ~~status, diagnostics~~, local storage, and the terminal UI.
-- Local storage operations: write, read, list, and create directories, with path validation.
-- Text preview for supported files up to 1 MB.
-- Opens images and videos in the operating system's default application.
-- Path validation rejects traversal, absolute paths, and symbolic links.
-- Unit tests cover storage, path rules, storage location, CLI parsing, and the terminal UI.
+- sync files to s3 (works locally as well) & pull from s3 using cli commands -> tui untested for this
+- basic files like text, md, and other code files work and sync flawlessly.
+- audio and videos sync but wait for uploading/downloading -> solving this is on the roadmap next
 
-## Planned roadmap
-
-- [ ] Introduce a storage abstraction for local and cloud backends.
-- [ ] Integrate Amazon S3 using the AWS SDK for Rust.
-- [ ] Implement streaming and caching.
-- [ ] Mount the storage as a Windows filesystem with WinFsp.
-- [ ] Improve support for AI-agent file workflows.
-- [ ] Benchmark performance, latency, bandwidth, and storage costs.
-- [ ] Expand security testing and documentation.
 
 ## Requirements
 
@@ -35,17 +23,17 @@ The storage directory is resolved when a command needs it:
 4. On Windows, `%LOCALAPPDATA%\infinite-storage`, falling back to
    `%USERPROFILE%\infinite-storage`.
 
-Storage commands create the directory automatically. **The terminal UI requires the directory to exist**, so run a storage command before opening it for the first time. Relative values are rejected so the location never depends on the working directory. Override the location for development or tests:
+The storage directory is created automatically when the app starts. Relative values are rejected so the location never depends on the working directory. Override the location for development or tests:
 
 ```bash
-INFINITE_STORAGE_DATA=/tmp/infinite-storage-data cargo run -- storage list
+INFINITE_STORAGE_DATA=/tmp/infinite-storage-data cargo run
 ```
 
 For a shared or persistent location outside `$HOME`, create the directory once and point the override at it:
 
 ```bash
 sudo install -d -o "$USER" -g "$USER" /var/lib/infinite-storage
-INFINITE_STORAGE_DATA=/var/lib/infinite-storage cargo run -- storage list
+INFINITE_STORAGE_DATA=/var/lib/infinite-storage cargo run
 ```
 
 Keep test files and development data separate from important personal files.
