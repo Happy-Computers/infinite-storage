@@ -23,11 +23,19 @@ A cloud filesystem that's infinitely scalable for humans and agents alike.
  InfiniteFS loads that file only when it starts a sync. `.env.local` is ignored by Git, and values
  already exported in your shell take precedence.
  
- Watch a project:
+Watch a project:
  
  ```bash
- cargo run --release -- sync --watch /path/to/project
- ```
+cargo run --release -- sync --watch /path/to/project
+```
+
+InfiniteFS transfers eight files at a time by default. Use `--concurrency` to compare a different
+bounded limit:
+
+```bash
+cargo run --release -- sync --concurrency 4 /path/to/project
+cargo run --release -- pull --concurrency 16 infinitefs-demo /tmp/infinitefs-pulled
+```
  
  The command uploads all regular files recursively at startup, then watches for changes. It stores
  chunks and a manifest below a directory named after the synced root in the bucket. It reads and writes raw bytes, so file

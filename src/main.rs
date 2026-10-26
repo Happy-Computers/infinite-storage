@@ -53,11 +53,13 @@ enum Command {
 }
 
 struct PullCommand {
+    concurrency: usize,
     destination: PathBuf,
     root: String,
 }
 
 struct SyncCommand {
+    concurrency: usize,
     directory: PathBuf,
     watch: bool,
 }
@@ -76,39 +78,75 @@ fn parse_command(arguments: &[OsString]) -> Result<Option<Command>, &'static str
         Some("pull") => parse_pull(arguments).map(Some),
         Some("sync") => parse_sync(arguments).map(Some),
         _ => Err(
-            "Usage: infinitefs sync [--watch] <directory>\n       infinitefs pull <s3-root> <directory>",
+            "Usage: infinitefs sync [--watch] [--concurrency <1..=64>] <directory>\n       infinitefs pull [--concurrency <1..=64>] <s3-root> <directory>",
         ),
     }
 }
 
 fn parse_pull(arguments: &[OsString]) -> Result<Command, &'static str> {
-    if arguments.len() != 3 {
-        return Err("Usage: infinitefs pull <s3-root> <directory>");
+    let mut concurrency = sync::DEFAULT_TRANSFER_CONCURRENCY;
+    let mut paths = Vec::new();
+    let mut index = 1;
+    while index < arguments.len() {
+        if arguments[index] == "--concurrency" {
+            index += 1;
+            concurrency = parse_concurrency(arguments.get(index))?;
+        } else {
+            paths.push(&arguments[index]);
+        }
+        index += 1;
     }
-    let root = arguments[1]
+    if paths.len() != 2 {
+        return Err("Usage: infinitefs pull [--concurrency <1..=64>] <s3-root> <directory>");
+    }
+    let root = paths[0]
         .to_str()
         .filter(|root| !root.is_empty())
         .ok_or("The S3 root must be UTF-8")?;
     Ok(Command::Pull(PullCommand {
+        concurrency,
         root: root.to_owned(),
-        destination: PathBuf::from(&arguments[2]),
+        destination: PathBuf::from(paths[1]),
     }))
 }
 
 fn parse_sync(arguments: &[OsString]) -> Result<Command, &'static str> {
-    let (watch, directory_index) = if arguments.get(1).is_some_and(|value| value == "--watch") {
-        (true, 2)
-    } else {
-        (false, 1)
-    };
-    let directory = arguments
-        .get(directory_index)
-        .map(PathBuf::from)
-        .ok_or("Usage: infinitefs sync [--watch] <directory>")?;
-    if arguments.len() != directory_index + 1 {
-        return Err("Usage: infinitefs sync [--watch] <directory>");
+    let mut concurrency = sync::DEFAULT_TRANSFER_CONCURRENCY;
+    let mut directory = None;
+    let mut watch = false;
+    let mut index = 1;
+    while index < arguments.len() {
+        if arguments[index] == "--watch" {
+            watch = true;
+        } else if arguments[index] == "--concurrency" {
+            index += 1;
+            concurrency = parse_concurrency(arguments.get(index))?;
+        } else if directory
+            .replace(PathBuf::from(&arguments[index]))
+            .is_some()
+        {
+            return Err("Usage: infinitefs sync [--watch] [--concurrency <1..=64>] <directory>");
+        }
+        index += 1;
     }
-    Ok(Command::Sync(SyncCommand { directory, watch }))
+    let directory =
+        directory.ok_or("Usage: infinitefs sync [--watch] [--concurrency <1..=64>] <directory>")?;
+    Ok(Command::Sync(SyncCommand {
+        concurrency,
+        directory,
+        watch,
+    }))
+}
+
+fn parse_concurrency(argument: Option<&OsString>) -> Result<usize, &'static str> {
+    let concurrency = argument
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse().ok())
+        .ok_or("--concurrency must be an integer from 1 through 64")?;
+    if concurrency == 0 || concurrency > sync::MAX_TRANSFER_CONCURRENCY {
+        return Err("--concurrency must be an integer from 1 through 64");
+    }
+    Ok(concurrency)
 }
 
 fn run_pull(command: PullCommand) -> ExitCode {
@@ -120,13 +158,21 @@ fn run_pull(command: PullCommand) -> ExitCode {
         }
     };
 
-    match runtime.block_on(sync::pull(&command.root, &command.destination)) {
+    match runtime.block_on(sync::pull(
+        &command.root,
+        &command.destination,
+        command.concurrency,
+    )) {
         Ok(result) => {
             println!("Pulled {} files.", result.file_count);
             if result.newer_version_available
                 && retry_newer_version(&mut io::stdin().lock(), &mut io::stderr())
             {
-                match runtime.block_on(sync::pull(&command.root, &command.destination)) {
+                match runtime.block_on(sync::pull(
+                    &command.root,
+                    &command.destination,
+                    command.concurrency,
+                )) {
                     Ok(retry) => println!("Pulled {} files.", retry.file_count),
                     Err(error) => {
                         eprintln!("Could not pull {}: {error}", command.root);
@@ -178,7 +224,11 @@ fn run_sync(command: SyncCommand) -> ExitCode {
         }
     };
 
-    match runtime.block_on(sync::run(&command.directory, command.watch)) {
+    match runtime.block_on(sync::run(
+        &command.directory,
+        command.watch,
+        command.concurrency,
+    )) {
         Ok(file_count) => {
             println!("Synced {file_count} files.");
             ExitCode::SUCCESS
@@ -208,6 +258,7 @@ mod tests {
         };
         assert_eq!(command.directory, PathBuf::from("project"));
         assert!(command.watch);
+        assert_eq!(command.concurrency, sync::DEFAULT_TRANSFER_CONCURRENCY);
 
         let Command::Pull(command) = parse_command(&[
             OsString::from("pull"),
@@ -220,6 +271,39 @@ mod tests {
         };
         assert_eq!(command.root, "project");
         assert_eq!(command.destination, PathBuf::from("output"));
+        assert_eq!(command.concurrency, sync::DEFAULT_TRANSFER_CONCURRENCY);
+
+        let Command::Sync(command) = parse_command(&[
+            OsString::from("sync"),
+            OsString::from("--concurrency"),
+            OsString::from("16"),
+            OsString::from("project"),
+        ])
+        .unwrap()
+        .unwrap() else {
+            panic!("expected sync command");
+        };
+        assert_eq!(command.concurrency, 16);
+
+        let Command::Pull(command) = parse_command(&[
+            OsString::from("pull"),
+            OsString::from("--concurrency"),
+            OsString::from("4"),
+            OsString::from("project"),
+            OsString::from("output"),
+        ])
+        .unwrap()
+        .unwrap() else {
+            panic!("expected pull command");
+        };
+        assert_eq!(command.concurrency, 4);
+    }
+
+    #[test]
+    fn rejects_invalid_transfer_concurrency() {
+        for value in ["0", "65", "many"] {
+            assert!(parse_concurrency(Some(&OsString::from(value))).is_err());
+        }
     }
 
     #[test]

@@ -19,7 +19,8 @@ use std::{
 };
 
 const CHUNK_SIZE: usize = 1024 * 1024;
-const TRANSFER_CONCURRENCY: usize = 4;
+pub const DEFAULT_TRANSFER_CONCURRENCY: usize = 8;
+pub const MAX_TRANSFER_CONCURRENCY: usize = 64;
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(200);
 const EVENT_BATCH_CAPACITY: usize = 32;
 const EVENT_PATH_LIMIT: usize = 4096;
@@ -28,7 +29,8 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 static PARTIAL_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static UPLOAD_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub async fn run(directory: &Path, watch: bool) -> Result<u32, Error> {
+pub async fn run(directory: &Path, watch: bool, concurrency: usize) -> Result<u32, Error> {
+    assert_transfer_concurrency(concurrency);
     load_local_environment()?;
     let source = canonical_source(directory)?;
     let bucket = required_environment("INFINITEFS_S3_BUCKET")?;
@@ -37,10 +39,12 @@ pub async fn run(directory: &Path, watch: bool) -> Result<u32, Error> {
         .build()?;
 
     if watch {
-        watch_directory(&store, source).await
+        watch_directory(&store, source, concurrency).await
     } else {
         let mut index = SyncIndex::load(&store, &source).await?;
-        index.rescan(&store, &source).await?;
+        index
+            .rescan_with_concurrency(&store, &source, concurrency)
+            .await?;
         Ok(index.file_count())
     }
 }
@@ -59,21 +63,28 @@ pub struct PullResult {
     pub newer_version_available: bool,
 }
 
-pub async fn pull(root: &str, destination: &Path) -> Result<PullResult, Error> {
+pub async fn pull(root: &str, destination: &Path, concurrency: usize) -> Result<PullResult, Error> {
+    assert_transfer_concurrency(concurrency);
     load_local_environment()?;
     let bucket = required_environment("INFINITEFS_S3_BUCKET")?;
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .build()?;
-    pull_directory(&store, root, destination).await
+    pull_directory_with_concurrency(&store, root, destination, concurrency).await
 }
 
+fn assert_transfer_concurrency(concurrency: usize) {
+    assert!(concurrency > 0);
+    assert!(concurrency <= MAX_TRANSFER_CONCURRENCY);
+}
+
+#[cfg(test)]
 async fn pull_directory(
     store: &dyn ObjectStore,
     root: &str,
     destination: &Path,
 ) -> Result<PullResult, Error> {
-    pull_directory_with_concurrency(store, root, destination, TRANSFER_CONCURRENCY).await
+    pull_directory_with_concurrency(store, root, destination, DEFAULT_TRANSFER_CONCURRENCY).await
 }
 
 async fn pull_directory_with_concurrency(
@@ -82,7 +93,7 @@ async fn pull_directory_with_concurrency(
     destination: &Path,
     concurrency: usize,
 ) -> Result<PullResult, Error> {
-    assert!(concurrency > 0);
+    assert_transfer_concurrency(concurrency);
     let prefix = ObjectPath::from(root);
     let mut objects = store.list(Some(&prefix));
     let mut manifest_paths = Vec::new();
@@ -153,7 +164,7 @@ async fn newer_complete_manifests(
     downloaded: &[(ObjectPath, Manifest)],
     concurrency: usize,
 ) -> Result<bool, Error> {
-    assert!(concurrency > 0);
+    assert_transfer_concurrency(concurrency);
     let mut manifests = futures_util::stream::iter(downloaded)
         .map(|(path, manifest)| newer_complete_manifest(store, path, manifest))
         .buffer_unordered(concurrency);
@@ -525,17 +536,22 @@ fn parse_generation(value: &str) -> Result<String, Error> {
     }
 }
 
-async fn watch_directory(store: &dyn ObjectStore, source: PathBuf) -> Result<u32, Error> {
+async fn watch_directory(
+    store: &dyn ObjectStore,
+    source: PathBuf,
+    concurrency: usize,
+) -> Result<u32, Error> {
+    assert_transfer_concurrency(concurrency);
     let (sender, receiver) = mpsc::sync_channel(EVENT_BATCH_CAPACITY);
     let rescan_requested = Arc::new(AtomicBool::new(false));
     let _debouncer = create_watcher(&source, sender, Arc::clone(&rescan_requested))?;
     let mut index = SyncIndex::load(store, &source).await?;
-    rescan_watcher(&mut index, store, &source).await?;
+    rescan_watcher(&mut index, store, &source, concurrency).await?;
     let mut rescan_at = Instant::now() + RESCAN_INTERVAL;
 
     loop {
         if rescan_requested.swap(false, Ordering::AcqRel) || Instant::now() >= rescan_at {
-            rescan_watcher(&mut index, store, &source).await?;
+            rescan_watcher(&mut index, store, &source, concurrency).await?;
             rescan_at = Instant::now() + RESCAN_INTERVAL;
         }
 
@@ -554,8 +570,12 @@ async fn rescan_watcher(
     index: &mut SyncIndex,
     store: &dyn ObjectStore,
     source: &Path,
+    concurrency: usize,
 ) -> Result<(), Error> {
-    match index.rescan(store, source).await {
+    match index
+        .rescan_with_concurrency(store, source, concurrency)
+        .await
+    {
         Err(Error::ChangedDuringUpload(_)) => Ok(()),
         result => result,
     }
@@ -667,7 +687,7 @@ impl SyncIndex {
     }
 
     async fn rescan(&mut self, store: &dyn ObjectStore, source: &Path) -> Result<(), Error> {
-        self.rescan_with_concurrency(store, source, TRANSFER_CONCURRENCY)
+        self.rescan_with_concurrency(store, source, DEFAULT_TRANSFER_CONCURRENCY)
             .await
     }
 
@@ -677,7 +697,7 @@ impl SyncIndex {
         source: &Path,
         concurrency: usize,
     ) -> Result<(), Error> {
-        assert!(concurrency > 0);
+        assert_transfer_concurrency(concurrency);
         let current = regular_files(source)?;
         let mut seen = HashMap::new();
         let mut changed_paths = HashSet::new();
@@ -1214,8 +1234,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "reports serial and four-file transfer timing"]
-    async fn transfer_benchmark_reports_parallel_speedup() {
+    #[ignore = "reports transfer timing for each concurrency limit"]
+    async fn transfer_benchmark_reports_transfer_window_scaling() {
         let source = TestDirectory::new();
         for index in 0..24 {
             let name = format!("nested/file-{index:02}.bin");
@@ -1225,17 +1245,16 @@ mod tests {
         }
 
         let serial = time_transfer(&source.0, 1).await;
-        let parallel = time_transfer(&source.0, TRANSFER_CONCURRENCY).await;
-
-        println!(
-            "serial: push={:.3}s pull={:.3}s; parallel: push={:.3}s pull={:.3}s",
-            serial.push.as_secs_f64(),
-            serial.pull.as_secs_f64(),
-            parallel.push.as_secs_f64(),
-            parallel.pull.as_secs_f64(),
-        );
-        assert!(parallel.push < serial.push);
-        assert!(parallel.pull < serial.pull);
+        for concurrency in [2, DEFAULT_TRANSFER_CONCURRENCY, 16] {
+            let timing = time_transfer(&source.0, concurrency).await;
+            println!(
+                "concurrency={concurrency}: push={:.3}s pull={:.3}s",
+                timing.push.as_secs_f64(),
+                timing.pull.as_secs_f64(),
+            );
+            assert!(timing.push < serial.push);
+            assert!(timing.pull < serial.pull);
+        }
     }
 
     #[tokio::test]
@@ -1686,7 +1705,7 @@ mod tests {
             newer_complete_manifests(
                 &store,
                 &[(a_path, a_manifest), (b_path, b_manifest)],
-                TRANSFER_CONCURRENCY,
+                DEFAULT_TRANSFER_CONCURRENCY,
             )
             .await
             .unwrap()
