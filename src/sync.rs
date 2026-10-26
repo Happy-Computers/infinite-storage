@@ -19,6 +19,7 @@ use std::{
 };
 
 const CHUNK_SIZE: usize = 1024 * 1024;
+const TRANSFER_CONCURRENCY: usize = 4;
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(200);
 const EVENT_BATCH_CAPACITY: usize = 32;
 const EVENT_PATH_LIMIT: usize = 4096;
@@ -72,23 +73,43 @@ async fn pull_directory(
     root: &str,
     destination: &Path,
 ) -> Result<PullResult, Error> {
+    pull_directory_with_concurrency(store, root, destination, TRANSFER_CONCURRENCY).await
+}
+
+async fn pull_directory_with_concurrency(
+    store: &dyn ObjectStore,
+    root: &str,
+    destination: &Path,
+    concurrency: usize,
+) -> Result<PullResult, Error> {
+    assert!(concurrency > 0);
     let prefix = ObjectPath::from(root);
     let mut objects = store.list(Some(&prefix));
-    let mut complete = Vec::new();
-    let mut deleted = Vec::new();
-    let mut file_count = 0u32;
+    let mut manifest_paths = Vec::new();
 
     while let Some(object) = objects.next().await {
         let object = object?;
-        if object.location.filename() != Some("manifest") {
-            continue;
+        if object.location.filename() == Some("manifest") {
+            manifest_paths.push(object.location);
         }
-        let bytes = store.get(&object.location).await?.bytes().await?;
-        let manifest = Manifest::parse(&bytes)?;
-        let relative = manifest_relative(&prefix, &object.location)?;
+    }
 
+    let mut complete = Vec::new();
+    let mut deleted = Vec::new();
+    let prefix = &prefix;
+    let mut manifests = futures_util::stream::iter(manifest_paths)
+        .map(|path| async move {
+            let bytes = store.get(&path).await?.bytes().await?;
+            let manifest = Manifest::parse(&bytes)?;
+            let relative = manifest_relative(prefix, &path)?;
+            Ok::<_, Error>((path, manifest, relative))
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some(manifest) = manifests.next().await {
+        let (path, manifest, relative) = manifest?;
         match &manifest.state {
-            ManifestState::Complete => complete.push((object.location, manifest, relative)),
+            ManifestState::Complete => complete.push((path, manifest, relative)),
             ManifestState::Deleted => deleted.push(relative),
             ManifestState::Uploading => {}
         }
@@ -110,24 +131,34 @@ async fn pull_directory(
         }
     }
     let mut downloaded = Vec::new();
-    for (manifest_path, manifest, relative) in complete {
-        pull_file(store, &manifest_path, &manifest, destination, &relative).await?;
-        downloaded.push((manifest_path, manifest));
-        file_count += 1;
+    let mut pulls = futures_util::stream::iter(complete)
+        .map(|(path, manifest, relative)| async move {
+            pull_file(store, &path, &manifest, destination, &relative).await?;
+            Ok::<_, Error>((path, manifest))
+        })
+        .buffer_unordered(concurrency);
+    while let Some(pull) = pulls.next().await {
+        downloaded.push(pull?);
     }
+    let file_count = u32::try_from(downloaded.len()).expect("file count is bounded");
 
     Ok(PullResult {
         file_count,
-        newer_version_available: newer_complete_manifests(store, &downloaded).await?,
+        newer_version_available: newer_complete_manifests(store, &downloaded, concurrency).await?,
     })
 }
 
 async fn newer_complete_manifests(
     store: &dyn ObjectStore,
     downloaded: &[(ObjectPath, Manifest)],
+    concurrency: usize,
 ) -> Result<bool, Error> {
-    for (manifest_path, manifest) in downloaded {
-        if newer_complete_manifest(store, manifest_path, manifest).await? {
+    assert!(concurrency > 0);
+    let mut manifests = futures_util::stream::iter(downloaded)
+        .map(|(path, manifest)| newer_complete_manifest(store, path, manifest))
+        .buffer_unordered(concurrency);
+    while let Some(newer) = manifests.next().await {
+        if newer? {
             return Ok(true);
         }
     }
@@ -317,7 +348,11 @@ fn ensure_directory(path: &Path) -> Result<(), Error> {
     }
 
     for directory in missing.iter().rev() {
-        fs::create_dir(directory)?;
+        match fs::create_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
         let metadata = fs::symlink_metadata(directory)?;
         if metadata.file_type().is_symlink() {
             return Err(Error::SymbolicLink(directory.to_owned()));
@@ -632,10 +667,22 @@ impl SyncIndex {
     }
 
     async fn rescan(&mut self, store: &dyn ObjectStore, source: &Path) -> Result<(), Error> {
+        self.rescan_with_concurrency(store, source, TRANSFER_CONCURRENCY)
+            .await
+    }
+
+    async fn rescan_with_concurrency(
+        &mut self,
+        store: &dyn ObjectStore,
+        source: &Path,
+        concurrency: usize,
+    ) -> Result<(), Error> {
+        assert!(concurrency > 0);
         let current = regular_files(source)?;
         let mut seen = HashMap::new();
         let mut changed_paths = HashSet::new();
         let mut changed_path = None;
+        let mut uploads = Vec::new();
 
         for path in current {
             let snapshot = match file_snapshot(&path) {
@@ -644,18 +691,28 @@ impl SyncIndex {
                 Err(error) => return Err(error.into()),
             };
             if self.files.get(&path) != Some(&snapshot) {
-                match upload_file(store, source, &path).await {
-                    Ok(()) => {
-                        seen.insert(path, snapshot);
-                    }
-                    Err(Error::ChangedDuringUpload(_)) => {
-                        changed_paths.insert(path.clone());
-                        changed_path.get_or_insert(path);
-                    }
-                    Err(error) => return Err(error),
-                }
+                uploads.push((path, snapshot));
             } else {
                 seen.insert(path, snapshot);
+            }
+        }
+
+        let mut uploads = futures_util::stream::iter(uploads)
+            .map(|(path, snapshot)| async move {
+                let result = upload_file(store, source, &path).await;
+                (path, snapshot, result)
+            })
+            .buffer_unordered(concurrency);
+        while let Some((path, snapshot, result)) = uploads.next().await {
+            match result {
+                Ok(()) => {
+                    seen.insert(path, snapshot);
+                }
+                Err(Error::ChangedDuringUpload(_)) => {
+                    changed_paths.insert(path.clone());
+                    changed_path.get_or_insert(path);
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -1077,7 +1134,10 @@ impl From<notify::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::memory::InMemory;
+    use object_store::{
+        memory::InMemory,
+        throttle::{ThrottleConfig, ThrottledStore},
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1109,6 +1169,73 @@ mod tests {
             .join("manifest");
         let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    struct TransferTiming {
+        pull: Duration,
+        push: Duration,
+    }
+
+    async fn time_transfer(source: &Path, concurrency: usize) -> TransferTiming {
+        let store = ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(20),
+                wait_put_per_call: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        let mut index = SyncIndex::new();
+        let push_started = Instant::now();
+        index
+            .rescan_with_concurrency(&store, source, concurrency)
+            .await
+            .unwrap();
+        let push = push_started.elapsed();
+
+        let destination = TestDirectory::new();
+        let root = source.file_name().unwrap().to_str().unwrap();
+        let pull_started = Instant::now();
+        let result = pull_directory_with_concurrency(&store, root, &destination.0, concurrency)
+            .await
+            .unwrap();
+        let pull = pull_started.elapsed();
+
+        assert_eq!(result.file_count, 24);
+        for index in 0..24 {
+            let name = format!("nested/file-{index:02}.bin");
+            assert_eq!(
+                fs::read(destination.0.join(&name)).unwrap(),
+                name.as_bytes()
+            );
+        }
+
+        TransferTiming { pull, push }
+    }
+
+    #[tokio::test]
+    #[ignore = "reports serial and four-file transfer timing"]
+    async fn transfer_benchmark_reports_parallel_speedup() {
+        let source = TestDirectory::new();
+        for index in 0..24 {
+            let name = format!("nested/file-{index:02}.bin");
+            let path = source.0.join(&name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, name).unwrap();
+        }
+
+        let serial = time_transfer(&source.0, 1).await;
+        let parallel = time_transfer(&source.0, TRANSFER_CONCURRENCY).await;
+
+        println!(
+            "serial: push={:.3}s pull={:.3}s; parallel: push={:.3}s pull={:.3}s",
+            serial.push.as_secs_f64(),
+            serial.pull.as_secs_f64(),
+            parallel.push.as_secs_f64(),
+            parallel.pull.as_secs_f64(),
+        );
+        assert!(parallel.push < serial.push);
+        assert!(parallel.pull < serial.pull);
     }
 
     #[tokio::test]
@@ -1556,9 +1683,13 @@ mod tests {
         index.rescan(&store, &source.0).await.unwrap();
 
         assert!(
-            newer_complete_manifests(&store, &[(a_path, a_manifest), (b_path, b_manifest)],)
-                .await
-                .unwrap()
+            newer_complete_manifests(
+                &store,
+                &[(a_path, a_manifest), (b_path, b_manifest)],
+                TRANSFER_CONCURRENCY,
+            )
+            .await
+            .unwrap()
         );
     }
 
