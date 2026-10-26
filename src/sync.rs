@@ -304,6 +304,7 @@ fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
 struct Manifest {
     chunk_size: u64,
     generation: Option<String>,
+    modified_ns: Option<u64>,
     size: u64,
     state: ManifestState,
 }
@@ -314,6 +315,7 @@ impl Manifest {
             .map_err(|_| Error::InvalidManifest("manifest is not UTF-8"))?;
         let mut chunk_size = None;
         let mut generation = None;
+        let mut modified_ns = None;
         let mut size = None;
         let mut state = None;
 
@@ -324,6 +326,7 @@ impl Manifest {
             match key {
                 "chunk_size" => chunk_size = Some(parse_manifest_number(value)?),
                 "generation" => generation = Some(parse_generation(value)?),
+                "modified_ns" => modified_ns = Some(parse_manifest_number(value)?),
                 "size" => size = Some(parse_manifest_number(value)?),
                 "state" => state = Some(ManifestState::parse(value)?),
                 _ => {}
@@ -338,6 +341,7 @@ impl Manifest {
         Ok(Self {
             chunk_size,
             generation,
+            modified_ns,
             size: size.ok_or(Error::InvalidManifest("manifest is missing size"))?,
             state: state.ok_or(Error::InvalidManifest("manifest is missing state"))?,
         })
@@ -520,6 +524,7 @@ impl SyncIndex {
             .ok_or_else(|| Error::NonUtf8Path(source.to_owned()))?;
         let prefix = ObjectPath::from(root);
         let mut objects = store.list(Some(&prefix));
+        let mut files = HashMap::new();
         let mut remote_files = HashSet::new();
 
         while let Some(object) = objects.next().await {
@@ -529,12 +534,16 @@ impl SyncIndex {
             }
             let manifest = Manifest::parse(&store.get(&object.location).await?.bytes().await?)?;
             if matches!(manifest.state, ManifestState::Complete) {
-                remote_files.insert(source.join(manifest_relative(&prefix, &object.location)?));
+                let path = source.join(manifest_relative(&prefix, &object.location)?);
+                if manifest_matches_file(&manifest, &path) {
+                    files.insert(path.clone(), file_snapshot(&path)?);
+                }
+                remote_files.insert(path);
             }
         }
 
         Ok(Self {
-            files: HashMap::new(),
+            files,
             remote_files,
         })
     }
@@ -658,6 +667,7 @@ async fn upload_file(
         confirmed_size,
         "uploading",
         Some(&generation),
+        Some(&snapshot_before),
     )
     .await?;
 
@@ -685,6 +695,7 @@ async fn upload_file(
             confirmed_size,
             "uploading",
             Some(&generation),
+            Some(&snapshot_before),
         )
         .await?;
         chunk_index += 1;
@@ -707,6 +718,7 @@ async fn upload_file(
         confirmed_size,
         "complete",
         Some(&generation),
+        Some(&snapshot_before),
     )
     .await?;
     println!("Synced {} ({confirmed_size} bytes).", relative.display());
@@ -716,7 +728,7 @@ async fn upload_file(
 async fn put_tombstone(store: &dyn ObjectStore, source: &Path, path: &Path) -> Result<(), Error> {
     let relative = relative_path(source, path)?;
     let manifest_path = object_prefix(source, relative)?.join("manifest");
-    put_manifest(store, &manifest_path, 0, "deleted", None).await
+    put_manifest(store, &manifest_path, 0, "deleted", None, None).await
 }
 
 async fn put_manifest(
@@ -725,12 +737,16 @@ async fn put_manifest(
     confirmed_size: u64,
     state: &str,
     generation: Option<&str>,
+    snapshot: Option<&FileSnapshot>,
 ) -> Result<(), Error> {
     let generation = generation
         .map(|value| format!("generation={value}\n"))
         .unwrap_or_default();
+    let modified_ns = snapshot
+        .map(|value| format!("modified_ns={}\n", value.modified_ns))
+        .unwrap_or_default();
     let manifest = format!(
-        "version=2\nsize={confirmed_size}\nchunk_size={CHUNK_SIZE}\n{generation}state={state}\n"
+        "version=2\nsize={confirmed_size}\nchunk_size={CHUNK_SIZE}\n{generation}{modified_ns}state={state}\n"
     );
     store.put(path, manifest.into()).await?;
     Ok(())
@@ -843,15 +859,32 @@ fn read_chunk(reader: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileSnapshot {
     length: u64,
-    modified: SystemTime,
+    modified_ns: u64,
 }
 
 fn file_snapshot(path: &Path) -> io::Result<FileSnapshot> {
     let metadata = fs::metadata(path)?;
+    let modified_ns = metadata
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file time precedes epoch"))?
+        .as_nanos()
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file time is too large"))?;
     Ok(FileSnapshot {
         length: metadata.len(),
-        modified: metadata.modified()?,
+        modified_ns,
     })
+}
+
+fn manifest_matches_file(manifest: &Manifest, path: &Path) -> bool {
+    let Some(modified_ns) = manifest.modified_ns else {
+        return false;
+    };
+    match file_snapshot(path) {
+        Ok(snapshot) => snapshot.length == manifest.size && snapshot.modified_ns == modified_ns,
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug)]
@@ -1018,6 +1051,20 @@ mod tests {
             manifest(&store, &source.0, "package.json").await,
             format!("version=2\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
         );
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_reupload_unchanged_files() {
+        let source = TestDirectory::new();
+        fs::write(source.0.join("package.json"), "{}").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+        let before = manifest(&store, &source.0, "package.json").await;
+
+        let mut index = SyncIndex::load(&store, &source.0).await.unwrap();
+        index.rescan(&store, &source.0).await.unwrap();
+
+        assert_eq!(manifest(&store, &source.0, "package.json").await, before);
     }
 
     #[cfg(unix)]
