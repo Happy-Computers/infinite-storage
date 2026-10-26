@@ -6,7 +6,14 @@ mod tui;
 #[allow(dead_code)]
 mod vpath;
 
-use std::{env, ffi::OsString, fs, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    io::{self, BufRead, IsTerminal, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 fn main() -> ExitCode {
     match command() {
@@ -114,8 +121,19 @@ fn run_pull(command: PullCommand) -> ExitCode {
     };
 
     match runtime.block_on(sync::pull(&command.root, &command.destination)) {
-        Ok(file_count) => {
-            println!("Pulled {file_count} files.");
+        Ok(result) => {
+            println!("Pulled {} files.", result.file_count);
+            if result.newer_version_available
+                && retry_newer_version(&mut io::stdin().lock(), &mut io::stderr())
+            {
+                match runtime.block_on(sync::pull(&command.root, &command.destination)) {
+                    Ok(retry) => println!("Pulled {} files.", retry.file_count),
+                    Err(error) => {
+                        eprintln!("Could not pull {}: {error}", command.root);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -123,6 +141,32 @@ fn run_pull(command: PullCommand) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn retry_newer_version(input: &mut impl BufRead, output: &mut impl Write) -> bool {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        eprintln!("A newer version is available. Run pull again to download it.");
+        return false;
+    }
+    if write!(
+        output,
+        "A newer version is available. Download it now? [y/N] "
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if output.flush().is_err() {
+        return false;
+    }
+    wants_newer_version(input)
+}
+
+fn wants_newer_version(input: &mut impl BufRead) -> bool {
+    let mut response = String::new();
+    input
+        .read_line(&mut response)
+        .is_ok_and(|_| matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 fn run_sync(command: SyncCommand) -> ExitCode {
@@ -176,5 +220,15 @@ mod tests {
         };
         assert_eq!(command.root, "project");
         assert_eq!(command.destination, PathBuf::from("output"));
+    }
+
+    #[test]
+    fn accepts_only_explicit_pull_retry_answers() {
+        for answer in ["y\n", "Y\n", "yes\n", "YES\n"] {
+            assert!(wants_newer_version(&mut io::Cursor::new(answer)));
+        }
+        for answer in ["\n", "n\n", "no\n", "later\n", ""] {
+            assert!(!wants_newer_version(&mut io::Cursor::new(answer)));
+        }
     }
 }

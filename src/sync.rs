@@ -52,7 +52,13 @@ fn load_local_environment() -> Result<(), Error> {
     }
 }
 
-pub async fn pull(root: &str, destination: &Path) -> Result<u32, Error> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct PullResult {
+    pub file_count: u32,
+    pub newer_version_available: bool,
+}
+
+pub async fn pull(root: &str, destination: &Path) -> Result<PullResult, Error> {
     load_local_environment()?;
     let bucket = required_environment("INFINITEFS_S3_BUCKET")?;
     let store = AmazonS3Builder::from_env()
@@ -65,12 +71,13 @@ async fn pull_directory(
     store: &dyn ObjectStore,
     root: &str,
     destination: &Path,
-) -> Result<u32, Error> {
+) -> Result<PullResult, Error> {
     let prefix = ObjectPath::from(root);
     let mut objects = store.list(Some(&prefix));
     let mut complete = Vec::new();
     let mut deleted = Vec::new();
     let mut file_count = 0u32;
+    let mut newer_version_available = false;
 
     while let Some(object) = objects.next().await {
         let object = object?;
@@ -88,15 +95,43 @@ async fn pull_directory(
         }
     }
 
+    let complete_paths = complete
+        .iter()
+        .map(|(_, _, relative): &(_, _, PathBuf)| relative.as_path())
+        .collect::<HashSet<_>>();
     for relative in deleted {
         pull_deleted(destination, &relative)?;
+        let mut ancestor = relative.parent();
+        while let Some(parent) = ancestor {
+            if complete_paths.contains(parent) {
+                pull_prune_empty_ancestors(destination, &relative, parent)?;
+                break;
+            }
+            ancestor = parent.parent();
+        }
     }
     for (manifest_path, manifest, relative) in complete {
         pull_file(store, &manifest_path, &manifest, destination, &relative).await?;
+        if newer_complete_manifest(store, &manifest_path, &manifest).await? {
+            newer_version_available = true;
+        }
         file_count += 1;
     }
 
-    Ok(file_count)
+    Ok(PullResult {
+        file_count,
+        newer_version_available,
+    })
+}
+
+async fn newer_complete_manifest(
+    store: &dyn ObjectStore,
+    manifest_path: &ObjectPath,
+    downloaded: &Manifest,
+) -> Result<bool, Error> {
+    let bytes = store.get(manifest_path).await?.bytes().await?;
+    let current = Manifest::parse(&bytes)?;
+    Ok(matches!(current.state, ManifestState::Complete) && current != *downloaded)
 }
 
 async fn pull_file(
@@ -160,6 +195,30 @@ fn pull_deleted(destination_root: &Path, relative: &Path) -> Result<(), Error> {
         Ok(_) => fs::remove_file(destination)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn pull_prune_empty_ancestors(
+    destination_root: &Path,
+    deleted: &Path,
+    replacement: &Path,
+) -> Result<(), Error> {
+    let mut ancestor = deleted.parent();
+    while let Some(relative) = ancestor {
+        if relative == replacement {
+            break;
+        }
+        let Some(directory) = pull_existing_destination(destination_root, relative)? else {
+            break;
+        };
+        reject_symbolic_link(&directory)?;
+        match fs::remove_dir(&directory) {
+            Ok(()) => ancestor = relative.parent(),
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -300,7 +359,7 @@ fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Manifest {
     chunk_size: u64,
     generation: Option<String>,
@@ -363,7 +422,7 @@ impl Manifest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum ManifestState {
     Complete,
     Deleted,
@@ -597,6 +656,10 @@ impl SyncIndex {
             .collect::<HashSet<_>>();
         for path in previous {
             if !seen.contains_key(path) && !changed_paths.contains(path) {
+                if source_path_has_link(source, path)? {
+                    changed_paths.insert(path.clone());
+                    continue;
+                }
                 put_tombstone(store, source, path).await?;
             }
         }
@@ -630,6 +693,9 @@ impl SyncIndex {
             if !metadata.is_file() {
                 self.rescan(store, source).await?;
             } else {
+                if source_path_has_link(source, &path)? {
+                    continue;
+                }
                 match file_snapshot(&path) {
                     Ok(snapshot) => {
                         if self.files.get(&path) == Some(&snapshot) {
@@ -659,7 +725,16 @@ async fn upload_file(
     let prefix = object_prefix(source, relative)?;
     let manifest_path = prefix.clone().join("manifest");
     let generation = upload_generation();
-    let snapshot_before = file_snapshot(file_path)?;
+    if source_path_has_link(source, file_path)? {
+        return Err(Error::ChangedDuringUpload(file_path.to_owned()));
+    }
+    let snapshot_before = match file_snapshot(file_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(Error::ChangedDuringUpload(file_path.to_owned()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut reader = match fs::File::open(file_path) {
         Ok(reader) => reader,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -823,6 +898,34 @@ fn regular_files(source: &Path) -> Result<Vec<PathBuf>, Error> {
 
     files.sort();
     Ok(files)
+}
+
+fn source_path_has_link(source: &Path, path: &Path) -> Result<bool, Error> {
+    let relative = relative_path(source, path)?;
+    let mut current = source.to_owned();
+    if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+        return Ok(true);
+    }
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(path.to_owned()));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 fn temporary_path(path: &Path) -> bool {
@@ -1131,6 +1234,55 @@ mod tests {
         assert!(store.get(&path).await.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watcher_ignores_files_beneath_symbolic_linked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let source = TestDirectory::new();
+        let outside = TestDirectory::new();
+        fs::write(outside.0.join("secret.txt"), "secret").unwrap();
+        symlink(&outside.0, source.0.join("linked")).unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+
+        index
+            .apply_paths(&store, &source.0, vec![source.0.join("linked/secret.txt")])
+            .await
+            .unwrap();
+
+        let path = object_prefix(&source.0, Path::new("linked/secret.txt"))
+            .unwrap()
+            .join("manifest");
+        assert!(store.get(&path).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watcher_link_event_does_not_tombstone_existing_file() {
+        use std::os::unix::fs::symlink;
+
+        let source = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let file = source.0.join("nested/file");
+        fs::create_dir(file.parent().unwrap()).unwrap();
+        fs::write(&file, "original").unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+        index.rescan(&store, &source.0).await.unwrap();
+        let previous = manifest(&store, &source.0, "nested/file").await;
+
+        fs::rename(source.0.join("nested"), outside.0.join("saved")).unwrap();
+        symlink(outside.0.join("saved"), source.0.join("nested")).unwrap();
+        index
+            .apply_paths(&store, &source.0, vec![file])
+            .await
+            .unwrap();
+
+        index.rescan(&store, &source.0).await.unwrap();
+        assert_eq!(manifest(&store, &source.0, "nested/file").await, previous);
+    }
+
     #[test]
     fn regular_files_tolerates_a_vanished_directory() {
         let source = TestDirectory::new();
@@ -1154,7 +1306,10 @@ mod tests {
         let root = source.0.file_name().unwrap().to_str().unwrap();
         assert_eq!(
             pull_directory(&store, root, &destination.0).await.unwrap(),
-            1
+            PullResult {
+                file_count: 1,
+                newer_version_available: false,
+            }
         );
         assert_eq!(
             fs::read(destination.0.join("nested/hello.txt")).unwrap(),
@@ -1209,19 +1364,18 @@ mod tests {
     #[tokio::test]
     async fn pull_replaces_directories_with_files() {
         let source = TestDirectory::new();
-        fs::create_dir(source.0.join("a")).unwrap();
-        fs::write(source.0.join("a/old"), "old").unwrap();
+        fs::create_dir_all(source.0.join("a/b")).unwrap();
+        fs::write(source.0.join("a/b/c"), "old").unwrap();
         let store = InMemory::new();
         let mut index = SyncIndex::new();
         index.rescan(&store, &source.0).await.unwrap();
+        let destination = TestDirectory::new();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
+        pull_directory(&store, root, &destination.0).await.unwrap();
+
         fs::remove_dir_all(source.0.join("a")).unwrap();
         fs::write(source.0.join("a"), "remote file").unwrap();
         index.rescan(&store, &source.0).await.unwrap();
-
-        let destination = TestDirectory::new();
-        fs::create_dir(destination.0.join("a")).unwrap();
-        fs::write(destination.0.join("a/old"), "old").unwrap();
-        let root = source.0.file_name().unwrap().to_str().unwrap();
         pull_directory(&store, root, &destination.0).await.unwrap();
 
         assert_eq!(
@@ -1329,6 +1483,43 @@ mod tests {
         assert_eq!(
             fs::read_to_string(destination.0.join("hello.txt")).unwrap(),
             "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn detects_a_newer_complete_generation_after_pull() {
+        let source = TestDirectory::new();
+        let file = source.0.join("hello.txt");
+        fs::write(&file, "first").unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+        index.rescan(&store, &source.0).await.unwrap();
+        let manifest_path = object_prefix(&source.0, Path::new("hello.txt"))
+            .unwrap()
+            .join("manifest");
+        let downloaded = Manifest::parse(
+            &store
+                .get(&manifest_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !newer_complete_manifest(&store, &manifest_path, &downloaded)
+                .await
+                .unwrap()
+        );
+
+        fs::write(&file, "second-version").unwrap();
+        index.rescan(&store, &source.0).await.unwrap();
+
+        assert!(
+            newer_complete_manifest(&store, &manifest_path, &downloaded)
+                .await
+                .unwrap()
         );
     }
 

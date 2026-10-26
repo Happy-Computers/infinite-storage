@@ -146,7 +146,7 @@ becomes `"complete"` and `size` is final.
    chunks into one normal object with `UploadPartCopy` so non-InfiniteFS clients see a single
    `files/<path>` key. Do this only when someone needs it; it costs one server-side copy.
 4. Rename = write a new manifest and tombstone the old one. Delete = tombstone. Chunks are
-   immutable and garbage-collected by a background sweep. Never rewrite a chunk.
+   immutable and retained as file checkpoints. Never rewrite or automatically delete a chunk.
 5. Keep each synced root in its own top-level S3 prefix.
 
 ### Reader path
@@ -157,6 +157,8 @@ becomes `"complete"` and `size` is final.
    stop after 64 KiB. Video can be seeked with ranges.
 3. For remote -> local, download to `<name>.infinitefs-partial`, verify the hash, then rename
    into place. Never write a partial file under the real name.
+4. After a complete pull, check whether a newer manifest was published. Keep the downloaded
+   checkpoint and let the user choose whether to pull the newer version.
 
 ### Conflict handling
 
