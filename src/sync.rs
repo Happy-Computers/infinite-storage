@@ -437,6 +437,7 @@ struct SyncIndex {
 }
 
 impl SyncIndex {
+    #[cfg(test)]
     fn new() -> Self {
         Self {
             files: HashMap::new(),
@@ -533,11 +534,9 @@ impl SyncIndex {
                 }
                 Err(error) => return Err(error.into()),
             };
-            if metadata.file_type().is_symlink() {
+            if !metadata.is_file() {
                 self.rescan(store, source).await?;
-            } else if metadata.is_dir() {
-                self.rescan(store, source).await?;
-            } else if metadata.is_file() {
+            } else {
                 match file_snapshot(&path) {
                     Ok(snapshot) => {
                         if self.files.get(&path) == Some(&snapshot) {
@@ -552,8 +551,6 @@ impl SyncIndex {
                     }
                     Err(error) => return Err(error.into()),
                 }
-            } else {
-                self.rescan(store, source).await?;
             }
         }
         Ok(())
