@@ -1,5 +1,16 @@
 # Roadmap
 
+## Continuously pull remote changes
+
+Changes synced from one machine must arrive safely on another without manually running `pull`.
+
+- Poll remote manifests and pull each new complete generation into the destination directory.
+- Apply remote deletions without following symbolic links or deleting unrelated local files.
+- Do not upload files written by the puller back to S3.
+- When both machines changed the same path, preserve both versions by writing a conflict copy.
+- Prove the flow with two local directories: sync on the first, observe the update on the second,
+  then make concurrent edits and confirm that neither version is lost.
+
 ## Stream media before transfer completion
 
 Videos, audio, and other large media must play while InfiniteFS uploads or downloads them.

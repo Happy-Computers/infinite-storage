@@ -3,7 +3,10 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use notify::{Config, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
-use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult, UpdateVersion,
+    aws::AmazonS3Builder, path::Path as ObjectPath,
+};
 use percent_encoding::percent_decode_str;
 use std::{
     collections::{HashMap, HashSet},
@@ -797,7 +800,36 @@ async fn upload_file(
     source: &Path,
     file_path: &Path,
 ) -> Result<(), Error> {
-    let relative = relative_path(source, file_path)?;
+    let relative = relative_path(source, file_path)?.to_owned();
+    match upload_file_at(store, source, file_path, &relative).await {
+        Ok(confirmed_size) => {
+            println!("Synced {} ({confirmed_size} bytes).", relative.display());
+            Ok(())
+        }
+        Err(Error::ManifestConflict(_)) => {
+            let conflict = conflict_relative(
+                &relative,
+                &crate::platform::device_id()?,
+                &upload_generation(),
+            )?;
+            let confirmed_size = upload_file_at(store, source, file_path, &conflict).await?;
+            println!(
+                "Synced conflict {} as {} ({confirmed_size} bytes).",
+                relative.display(),
+                conflict.display(),
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn upload_file_at(
+    store: &dyn ObjectStore,
+    source: &Path,
+    file_path: &Path,
+    relative: &Path,
+) -> Result<u64, Error> {
     let prefix = object_prefix(source, relative)?;
     let manifest_path = prefix.clone().join("manifest");
     let generation = upload_generation();
@@ -821,16 +853,21 @@ async fn upload_file(
     let mut buffer = vec![0; CHUNK_SIZE];
     let mut chunk_index = 0u64;
     let mut confirmed_size = 0u64;
+    let mut manifest_mode = manifest_put_mode(store, &manifest_path).await?;
 
-    put_manifest(
-        store,
-        &manifest_path,
-        confirmed_size,
-        "uploading",
-        Some(&generation),
-        Some(&snapshot_before),
-    )
-    .await?;
+    manifest_mode = PutMode::Update(
+        put_manifest(
+            store,
+            &manifest_path,
+            confirmed_size,
+            "uploading",
+            Some(&generation),
+            Some(&snapshot_before),
+            manifest_mode,
+        )
+        .await?
+        .into(),
+    );
 
     loop {
         let byte_count = read_chunk(&mut reader, &mut buffer)?;
@@ -850,15 +887,19 @@ async fn upload_file(
             )
             .await?;
         confirmed_size += u64::try_from(byte_count).expect("chunk size fits in u64");
-        put_manifest(
-            store,
-            &manifest_path,
-            confirmed_size,
-            "uploading",
-            Some(&generation),
-            Some(&snapshot_before),
-        )
-        .await?;
+        manifest_mode = PutMode::Update(
+            put_manifest(
+                store,
+                &manifest_path,
+                confirmed_size,
+                "uploading",
+                Some(&generation),
+                Some(&snapshot_before),
+                manifest_mode,
+            )
+            .await?
+            .into(),
+        );
         chunk_index += 1;
     }
 
@@ -880,16 +921,29 @@ async fn upload_file(
         "complete",
         Some(&generation),
         Some(&snapshot_before),
+        manifest_mode,
     )
     .await?;
-    println!("Synced {} ({confirmed_size} bytes).", relative.display());
-    Ok(())
+    Ok(confirmed_size)
 }
 
 async fn put_tombstone(store: &dyn ObjectStore, source: &Path, path: &Path) -> Result<(), Error> {
     let relative = relative_path(source, path)?;
     let manifest_path = object_prefix(source, relative)?.join("manifest");
-    put_manifest(store, &manifest_path, 0, "deleted", None, None).await
+    let mode = manifest_put_mode(store, &manifest_path).await?;
+    put_manifest(store, &manifest_path, 0, "deleted", None, None, mode).await?;
+    Ok(())
+}
+
+async fn manifest_put_mode(store: &dyn ObjectStore, path: &ObjectPath) -> Result<PutMode, Error> {
+    match store.head(path).await {
+        Ok(metadata) => Ok(PutMode::Update(UpdateVersion {
+            e_tag: metadata.e_tag,
+            version: metadata.version,
+        })),
+        Err(object_store::Error::NotFound { .. }) => Ok(PutMode::Create),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn put_manifest(
@@ -899,7 +953,8 @@ async fn put_manifest(
     state: &str,
     generation: Option<&str>,
     snapshot: Option<&FileSnapshot>,
-) -> Result<(), Error> {
+    mode: PutMode,
+) -> Result<PutResult, Error> {
     let generation = generation
         .map(|value| format!("generation={value}\n"))
         .unwrap_or_default();
@@ -912,8 +967,37 @@ async fn put_manifest(
     let manifest = format!(
         "version=2\nsize={confirmed_size}\nchunk_size={CHUNK_SIZE}\n{generation}{modified_ns}state={state}\n"
     );
-    store.put(path, manifest.into()).await?;
-    Ok(())
+    match store
+        .put_opts(
+            path,
+            manifest.into(),
+            PutOptions {
+                mode,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. },
+        ) => Err(Error::ManifestConflict(PathBuf::from(path.as_ref()))),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn conflict_relative(relative: &Path, device_id: &str, generation: &str) -> Result<PathBuf, Error> {
+    let name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::InvalidPath(relative.to_owned()))?;
+    let suffix = format!("-conflict-{device_id}-{generation}");
+    let conflict_name = if name.len() + suffix.len() <= 255 {
+        format!("{name}{suffix}")
+    } else {
+        format!("conflict-{device_id}-{generation}")
+    };
+    Ok(relative.with_file_name(conflict_name))
 }
 
 fn upload_generation() -> String {
@@ -1077,6 +1161,7 @@ pub enum Error {
     InvalidPath(PathBuf),
     InvalidRemotePath(String),
     Io(io::Error),
+    ManifestConflict(PathBuf),
     MissingEnvironment(String),
     NonUtf8Path(PathBuf),
     NotDirectory(PathBuf),
@@ -1103,6 +1188,13 @@ impl fmt::Display for Error {
             }
             Self::InvalidRemotePath(path) => write!(formatter, "invalid remote path: {path}"),
             Self::Io(error) => error.fmt(formatter),
+            Self::ManifestConflict(path) => {
+                write!(
+                    formatter,
+                    "manifest changed during upload: {}",
+                    path.display()
+                )
+            }
             Self::MissingEnvironment(name) => write!(formatter, "set {name}"),
             Self::NonUtf8Path(path) => write!(formatter, "{} is not UTF-8", path.display()),
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
@@ -1143,13 +1235,91 @@ impl From<notify::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream::BoxStream;
     use object_store::{
-        local::LocalFileSystem,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutPayload,
         memory::InMemory,
         throttle::{ThrottleConfig, ThrottledStore},
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug)]
+    struct FailingStore {
+        inner: InMemory,
+        failing_prefix: ObjectPath,
+    }
+
+    impl fmt::Display for FailingStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "FailingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingStore {
+        async fn put_opts(
+            &self,
+            path: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if path.as_ref().starts_with(self.failing_prefix.as_ref()) {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: Box::new(io::Error::other("blocked write")),
+                });
+            }
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -1253,14 +1423,12 @@ mod tests {
         let source = TestDirectory::new();
         fs::write(source.0.join("a-healthy.txt"), "healthy").unwrap();
         fs::write(source.0.join("z-failing.txt"), "failing").unwrap();
-        let store_root = TestDirectory::new();
         let root = source.0.file_name().unwrap().to_str().unwrap();
-        let blocked = store_root.0.join(root).join("z-failing.txt");
-        fs::create_dir_all(blocked.parent().unwrap()).unwrap();
-        fs::write(blocked, "not a directory").unwrap();
-        let local = LocalFileSystem::new_with_prefix(&store_root.0).unwrap();
         let store = ThrottledStore::new(
-            local.clone(),
+            FailingStore {
+                inner: InMemory::new(),
+                failing_prefix: ObjectPath::from(format!("{root}/z-failing.txt")),
+            },
             ThrottleConfig {
                 wait_put_per_call: Duration::from_millis(20),
                 ..Default::default()
@@ -1276,7 +1444,7 @@ mod tests {
         let path = object_prefix(&source.0, Path::new("a-healthy.txt"))
             .unwrap()
             .join("manifest");
-        let bytes = local.get(&path).await.unwrap().bytes().await.unwrap();
+        let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
         assert!(matches!(
             Manifest::parse(&bytes).unwrap().state,
             ManifestState::Complete
@@ -1318,6 +1486,61 @@ mod tests {
         assert_eq!(
             manifest(&store, &source.0, "project/package.json").await,
             format!("version=2\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_manifest_update_preserves_the_remote_manifest() {
+        let store = InMemory::new();
+        let path = ObjectPath::from("shared/report.txt/manifest");
+        let initial = put_manifest(
+            &store,
+            &path,
+            0,
+            "uploading",
+            Some("local"),
+            None,
+            PutMode::Create,
+        )
+        .await
+        .unwrap();
+        store
+            .put(
+                &path,
+                "version=2\nsize=6\nchunk_size=1048576\ngeneration=remote\nstate=complete\n".into(),
+            )
+            .await
+            .unwrap();
+
+        let error = put_manifest(
+            &store,
+            &path,
+            6,
+            "complete",
+            Some("local"),
+            None,
+            PutMode::Update(initial.into()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::ManifestConflict(_)));
+        let remote = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert!(remote.starts_with(b"version=2\nsize=6\n"));
+    }
+
+    #[test]
+    fn conflict_names_keep_short_filenames_readable() {
+        let conflict = conflict_relative(
+            Path::new("notes/report.txt"),
+            "aabbccddeeff00112233445566778899",
+            "123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            conflict,
+            PathBuf::from("notes/report.txt-conflict-aabbccddeeff00112233445566778899-123")
         );
     }
 

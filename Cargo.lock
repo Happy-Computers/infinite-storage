@@ -1030,10 +1030,12 @@ dependencies = [
 name = "infinitefs"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "crossterm",
  "dotenvy",
  "futures-util",
+ "getrandom 0.3.4",
  "notify",
  "notify-debouncer-full",
  "object_store",

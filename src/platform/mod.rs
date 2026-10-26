@@ -2,16 +2,85 @@
 //! with platform-neutral paths and settings. Code outside this module must not
 //! branch on the operating system or hardcode an OS path.
 
-use std::{env, ffi::OsString, io, path::PathBuf};
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 const STORAGE_DIRECTORY_ENV: &str = "INFINITE_STORAGE_DATA";
 
 const STORAGE_DIRECTORY_NAME: &str = "infinite-storage";
+const DEVICE_ID_FILE_NAME: &str = "device-id";
+const DEVICE_ID_BYTES: usize = 16;
 
 /// `INFINITE_STORAGE_DATA` takes precedence on every platform; otherwise the
 /// platform default applies.
 pub fn storage_directory() -> io::Result<PathBuf> {
     storage_directory_from(|name| env::var_os(name))
+}
+
+pub fn device_id() -> io::Result<String> {
+    let directory = storage_directory()?;
+    fs::create_dir_all(&directory)?;
+    device_id_in(&directory)
+}
+
+fn device_id_in(directory: &Path) -> io::Result<String> {
+    let path = directory.join(DEVICE_ID_FILE_NAME);
+    match fs::read_to_string(&path) {
+        Ok(id) => validate_device_id(id.trim()).map(str::to_owned),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => write_device_id(&path),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_device_id(path: &Path) -> io::Result<String> {
+    let id = random_device_id()?;
+    let temporary = path.with_file_name(format!(".{DEVICE_ID_FILE_NAME}-{id}"));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(id.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            fs::remove_file(temporary)?;
+            Ok(id)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(temporary)?;
+            device_id_in(path.parent().expect("device ID path has a parent"))
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(error)
+        }
+    }
+}
+
+fn random_device_id() -> io::Result<String> {
+    let mut bytes = [0; DEVICE_ID_BYTES];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| io::Error::other(format!("could not generate device ID: {error}")))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn validate_device_id(id: &str) -> io::Result<&str> {
+    if id.len() == DEVICE_ID_BYTES * 2 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(id)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "device ID is invalid",
+        ))
+    }
 }
 
 /// The lookup is injected so tests can supply variables without mutating the
@@ -200,5 +269,21 @@ mod tests {
         let error = storage_directory_from(lookup_from(&[("HOME", "relative/home")])).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn device_id_is_created_once() {
+        let directory =
+            std::env::temp_dir().join(format!("infinitefs-device-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+
+        let first = device_id_in(&directory).unwrap();
+        let second = device_id_in(&directory).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), DEVICE_ID_BYTES * 2);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        fs::remove_dir_all(directory).unwrap();
     }
 }
