@@ -1,5 +1,7 @@
 # Roadmap
 
+Known gaps and their fix order live in [docs/known-issues.md](docs/known-issues.md).
+
 ## Continuously pull remote changes
 
 Changes synced from one machine must arrive safely on another without manually running `pull`.

@@ -8,6 +8,9 @@ A cloud filesystem that's infinitely scalable for humans and agents alike.
 - basic files like text, md, and other code files work and sync flawlessly.
 - audio and videos sync but wait for uploading/downloading -> solving this is on the roadmap next
  
+ Before sharing a directory with another machine, read [known issues](docs/known-issues.md). Watching
+ a directory that does not hold the full remote tree currently deletes files from S3.
+
  ## Upload a directory to S3
  
  Set standard AWS environment variables and choose a bucket:
