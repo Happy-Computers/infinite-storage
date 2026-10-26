@@ -25,6 +25,7 @@ const EVENT_PATH_LIMIT: usize = 4096;
 const MAX_FILE_COUNT: u32 = 1_000_000;
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 static PARTIAL_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn run(directory: &Path, watch: bool) -> Result<u32, Error> {
     load_local_environment()?;
@@ -112,7 +113,11 @@ async fn pull_file(
     let mut written = 0u64;
 
     for index in 0..chunks {
-        let path = prefix.clone().join("chunks").join(format!("{index:08}"));
+        let mut path = prefix.clone().join("chunks");
+        if let Some(generation) = &manifest.generation {
+            path = path.join(generation.as_str());
+        }
+        let path = path.join(format!("{index:08}"));
         let bytes = store.get(&path).await?.bytes().await?;
         let expected = manifest.chunk_size.min(manifest.size - written);
         let length = u64::try_from(bytes.len()).map_err(|_| Error::ChunkTooLarge)?;
@@ -136,9 +141,14 @@ async fn pull_file(
 
 fn pull_deleted(destination_root: &Path, relative: &Path) -> Result<(), Error> {
     let (destination, _) = pull_destination_parent(destination_root, relative)?;
-    if destination.exists() {
-        reject_symbolic_link(&destination)?;
-        fs::remove_file(destination)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::SymbolicLink(destination));
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => fs::remove_file(destination)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -223,6 +233,7 @@ fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
 #[derive(Debug)]
 struct Manifest {
     chunk_size: u64,
+    generation: Option<String>,
     size: u64,
     state: ManifestState,
 }
@@ -232,6 +243,7 @@ impl Manifest {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| Error::InvalidManifest("manifest is not UTF-8"))?;
         let mut chunk_size = None;
+        let mut generation = None;
         let mut size = None;
         let mut state = None;
 
@@ -241,6 +253,7 @@ impl Manifest {
             };
             match key {
                 "chunk_size" => chunk_size = Some(parse_manifest_number(value)?),
+                "generation" => generation = Some(parse_generation(value)?),
                 "size" => size = Some(parse_manifest_number(value)?),
                 "state" => state = Some(ManifestState::parse(value)?),
                 _ => {}
@@ -254,6 +267,7 @@ impl Manifest {
         }
         Ok(Self {
             chunk_size,
+            generation,
             size: size.ok_or(Error::InvalidManifest("manifest is missing size"))?,
             state: state.ok_or(Error::InvalidManifest("manifest is missing state"))?,
         })
@@ -317,6 +331,15 @@ fn parse_manifest_number(value: &str) -> Result<u64, Error> {
     value
         .parse()
         .map_err(|_| Error::InvalidManifest("manifest number is invalid"))
+}
+
+fn parse_generation(value: &str) -> Result<String, Error> {
+    let path = VPath::parse(value).map_err(|_| Error::InvalidManifest("generation is invalid"))?;
+    if path.components().len() == 1 {
+        Ok(value.to_owned())
+    } else {
+        Err(Error::InvalidManifest("generation is invalid"))
+    }
 }
 
 async fn watch_directory(store: &dyn ObjectStore, source: PathBuf) -> Result<u32, Error> {
@@ -545,6 +568,7 @@ async fn upload_file(
     let relative = relative_path(source, file_path)?;
     let prefix = object_prefix(source, relative)?;
     let manifest_path = prefix.clone().join("manifest");
+    let generation = upload_generation();
     let snapshot_before = file_snapshot(file_path)?;
     let mut reader = match fs::File::open(file_path) {
         Ok(reader) => reader,
@@ -557,7 +581,14 @@ async fn upload_file(
     let mut chunk_index = 0u64;
     let mut confirmed_size = 0u64;
 
-    put_manifest(store, &manifest_path, confirmed_size, "uploading").await?;
+    put_manifest(
+        store,
+        &manifest_path,
+        confirmed_size,
+        "uploading",
+        Some(&generation),
+    )
+    .await?;
 
     loop {
         let byte_count = read_chunk(&mut reader, &mut buffer)?;
@@ -568,6 +599,7 @@ async fn upload_file(
         let chunk_path = prefix
             .clone()
             .join("chunks")
+            .join(generation.as_str())
             .join(format!("{chunk_index:08}"));
         store
             .put(
@@ -576,7 +608,14 @@ async fn upload_file(
             )
             .await?;
         confirmed_size += u64::try_from(byte_count).expect("chunk size fits in u64");
-        put_manifest(store, &manifest_path, confirmed_size, "uploading").await?;
+        put_manifest(
+            store,
+            &manifest_path,
+            confirmed_size,
+            "uploading",
+            Some(&generation),
+        )
+        .await?;
         chunk_index += 1;
     }
 
@@ -591,7 +630,14 @@ async fn upload_file(
         return Err(Error::ChangedDuringUpload(file_path.to_owned()));
     }
 
-    put_manifest(store, &manifest_path, confirmed_size, "complete").await?;
+    put_manifest(
+        store,
+        &manifest_path,
+        confirmed_size,
+        "complete",
+        Some(&generation),
+    )
+    .await?;
     println!("Synced {} ({confirmed_size} bytes).", relative.display());
     Ok(())
 }
@@ -599,7 +645,7 @@ async fn upload_file(
 async fn put_tombstone(store: &dyn ObjectStore, source: &Path, path: &Path) -> Result<(), Error> {
     let relative = relative_path(source, path)?;
     let manifest_path = object_prefix(source, relative)?.join("manifest");
-    put_manifest(store, &manifest_path, 0, "deleted").await
+    put_manifest(store, &manifest_path, 0, "deleted", None).await
 }
 
 async fn put_manifest(
@@ -607,11 +653,24 @@ async fn put_manifest(
     path: &ObjectPath,
     confirmed_size: u64,
     state: &str,
+    generation: Option<&str>,
 ) -> Result<(), Error> {
-    let manifest =
-        format!("version=1\nsize={confirmed_size}\nchunk_size={CHUNK_SIZE}\nstate={state}\n");
+    let generation = generation
+        .map(|value| format!("generation={value}\n"))
+        .unwrap_or_default();
+    let manifest = format!(
+        "version=2\nsize={confirmed_size}\nchunk_size={CHUNK_SIZE}\n{generation}state={state}\n"
+    );
     store.put(path, manifest.into()).await?;
     Ok(())
+}
+
+fn upload_generation() -> String {
+    let sequence = UPLOAD_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let elapsed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch");
+    format!("{}-{}-{sequence}", elapsed.as_nanos(), std::process::id())
 }
 
 fn canonical_source(directory: &Path) -> Result<PathBuf, Error> {
@@ -851,13 +910,11 @@ mod tests {
                 .as_ref(),
             format!("{root}/project/package.json")
         );
-        assert_eq!(
-            manifest(&store, &source.0, "project/package.json").await,
-            format!(
-                "version=1\nsize={}\nchunk_size={CHUNK_SIZE}\nstate=complete\n",
-                CHUNK_SIZE + 1
-            )
-        );
+        let uploaded_manifest = manifest(&store, &source.0, "project/package.json").await;
+        assert!(uploaded_manifest.contains("version=2\n"));
+        assert!(uploaded_manifest.contains(&format!("size={}\n", CHUNK_SIZE + 1)));
+        assert!(uploaded_manifest.contains("generation="));
+        assert!(uploaded_manifest.ends_with("state=complete\n"));
 
         fs::remove_file(&file).unwrap();
         index.rescan(&store, &source.0).await.unwrap();
@@ -870,7 +927,7 @@ mod tests {
         );
         assert_eq!(
             manifest(&store, &source.0, "project/package.json").await,
-            format!("version=1\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
+            format!("version=2\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
         );
     }
 
@@ -888,7 +945,7 @@ mod tests {
 
         assert_eq!(
             manifest(&store, &source.0, "package.json").await,
-            format!("version=1\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
+            format!("version=2\nsize=0\nchunk_size={CHUNK_SIZE}\nstate=deleted\n")
         );
     }
 
@@ -953,6 +1010,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pull_uses_the_generation_named_by_its_manifest() {
+        let source = TestDirectory::new();
+        let file = source.0.join("hello.txt");
+        fs::write(&file, "first").unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+        index.rescan(&store, &source.0).await.unwrap();
+        let manifest_path = object_prefix(&source.0, Path::new("hello.txt"))
+            .unwrap()
+            .join("manifest");
+        let first_manifest = Manifest::parse(
+            &store
+                .get(&manifest_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(&file, "second-version").unwrap();
+        index.rescan(&store, &source.0).await.unwrap();
+
+        let destination = TestDirectory::new();
+        pull_file(
+            &store,
+            &manifest_path,
+            &first_manifest,
+            &destination.0,
+            Path::new("hello.txt"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.0.join("hello.txt")).unwrap(),
+            "first"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn pull_rejects_symbolic_link_ancestors() {
@@ -993,6 +1091,21 @@ mod tests {
             Err(Error::SymbolicLink(_))
         ));
         assert_eq!(fs::read_to_string(outside_file).unwrap(), "keep");
+    }
+
+    #[test]
+    fn pull_delete_keeps_a_replacement_directory() {
+        let destination = TestDirectory::new();
+        let replacement = destination.0.join("a");
+        fs::create_dir_all(&replacement).unwrap();
+        fs::write(replacement.join("b"), "remote child").unwrap();
+
+        pull_deleted(&destination.0, Path::new("a")).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(replacement.join("b")).unwrap(),
+            "remote child"
+        );
     }
 
     #[test]
