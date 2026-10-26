@@ -77,7 +77,6 @@ async fn pull_directory(
     let mut complete = Vec::new();
     let mut deleted = Vec::new();
     let mut file_count = 0u32;
-    let mut newer_version_available = false;
 
     while let Some(object) = objects.next().await {
         let object = object?;
@@ -110,18 +109,29 @@ async fn pull_directory(
             ancestor = parent.parent();
         }
     }
+    let mut downloaded = Vec::new();
     for (manifest_path, manifest, relative) in complete {
         pull_file(store, &manifest_path, &manifest, destination, &relative).await?;
-        if newer_complete_manifest(store, &manifest_path, &manifest).await? {
-            newer_version_available = true;
-        }
+        downloaded.push((manifest_path, manifest));
         file_count += 1;
     }
 
     Ok(PullResult {
         file_count,
-        newer_version_available,
+        newer_version_available: newer_complete_manifests(store, &downloaded).await?,
     })
+}
+
+async fn newer_complete_manifests(
+    store: &dyn ObjectStore,
+    downloaded: &[(ObjectPath, Manifest)],
+) -> Result<bool, Error> {
+    for (manifest_path, manifest) in downloaded {
+        if newer_complete_manifest(store, manifest_path, manifest).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn newer_complete_manifest(
@@ -1518,6 +1528,35 @@ mod tests {
 
         assert!(
             newer_complete_manifest(&store, &manifest_path, &downloaded)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_every_downloaded_manifest_after_the_pull() {
+        let source = TestDirectory::new();
+        fs::write(source.0.join("a.txt"), "first").unwrap();
+        fs::write(source.0.join("b.txt"), "later").unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+        index.rescan(&store, &source.0).await.unwrap();
+        let a_path = object_prefix(&source.0, Path::new("a.txt"))
+            .unwrap()
+            .join("manifest");
+        let b_path = object_prefix(&source.0, Path::new("b.txt"))
+            .unwrap()
+            .join("manifest");
+        let a_manifest =
+            Manifest::parse(&store.get(&a_path).await.unwrap().bytes().await.unwrap()).unwrap();
+        let b_manifest =
+            Manifest::parse(&store.get(&b_path).await.unwrap().bytes().await.unwrap()).unwrap();
+
+        fs::write(source.0.join("a.txt"), "second-version").unwrap();
+        index.rescan(&store, &source.0).await.unwrap();
+
+        assert!(
+            newer_complete_manifests(&store, &[(a_path, a_manifest), (b_path, b_manifest)],)
                 .await
                 .unwrap()
         );
