@@ -1,3 +1,4 @@
+use crate::vpath::VPath;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use notify::{Config, RecursiveMode};
@@ -11,7 +12,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, TrySendError},
     },
     time::{Duration, Instant, SystemTime},
@@ -23,6 +24,7 @@ const EVENT_BATCH_CAPACITY: usize = 32;
 const EVENT_PATH_LIMIT: usize = 4096;
 const MAX_FILE_COUNT: u32 = 1_000_000;
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+static PARTIAL_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn run(directory: &Path, watch: bool) -> Result<u32, Error> {
     load_local_environment()?;
@@ -96,21 +98,13 @@ async fn pull_file(
     destination_root: &Path,
     relative: &Path,
 ) -> Result<(), Error> {
-    let destination = destination_root.join(relative);
-    let parent = destination
-        .parent()
-        .ok_or_else(|| Error::InvalidPath(destination.clone()))?;
-    fs::create_dir_all(parent)?;
+    let (destination, parent) = pull_destination_parent(destination_root, relative)?;
     reject_symbolic_link(&destination)?;
 
     let file_name = destination
         .file_name()
         .ok_or_else(|| Error::InvalidPath(destination.clone()))?;
-    let partial = parent.join(format!(
-        "{}.infinitefs-partial",
-        file_name.to_string_lossy()
-    ));
-    let mut output = fs::File::create(&partial)?;
+    let (partial, mut output) = create_partial_file(&parent, file_name)?;
     let chunks = manifest.chunk_count()?;
     let prefix = manifest_path
         .parent()
@@ -134,17 +128,85 @@ async fn pull_file(
         return Err(Error::InvalidManifest("chunk sizes do not match file size"));
     }
     output.sync_all()?;
+    pull_destination_parent(destination_root, relative)?;
+    reject_symbolic_link(&destination)?;
     fs::rename(partial, destination)?;
     Ok(())
 }
 
 fn pull_deleted(destination_root: &Path, relative: &Path) -> Result<(), Error> {
-    let destination = destination_root.join(relative);
+    let (destination, _) = pull_destination_parent(destination_root, relative)?;
     if destination.exists() {
         reject_symbolic_link(&destination)?;
         fs::remove_file(destination)?;
     }
     Ok(())
+}
+
+fn pull_destination_parent(
+    destination_root: &Path,
+    relative: &Path,
+) -> Result<(PathBuf, PathBuf), Error> {
+    ensure_directory(destination_root)?;
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| Error::InvalidPath(relative.to_owned()))?;
+    let mut parent = destination_root.to_owned();
+
+    for component in relative.parent().unwrap_or(Path::new("")).components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(relative.to_owned()));
+        };
+        parent.push(component);
+        ensure_directory(&parent)?;
+    }
+
+    Ok((parent.join(file_name), parent))
+}
+
+fn ensure_directory(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(Error::SymbolicLink(path.to_owned()))
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(Error::NotDirectory(path.to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path)?;
+            match fs::symlink_metadata(path)? {
+                metadata if metadata.file_type().is_symlink() => {
+                    Err(Error::SymbolicLink(path.to_owned()))
+                }
+                metadata if metadata.is_dir() => Ok(()),
+                _ => Err(Error::NotDirectory(path.to_owned())),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_partial_file(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> Result<(PathBuf, fs::File), Error> {
+    for _ in 0..1024 {
+        let sequence = PARTIAL_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let partial = parent.join(format!(
+            ".{}.infinitefs-partial-{}-{sequence}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+        ));
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&partial)
+        {
+            Ok(file) => return Ok((partial, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(Error::PartialFileCollision)
 }
 
 fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
@@ -237,15 +299,12 @@ fn manifest_relative(prefix: &ObjectPath, manifest: &ObjectPath) -> Result<PathB
         let part = percent_decode_str(part.as_ref())
             .decode_utf8()
             .map_err(|_| Error::InvalidRemotePath(manifest.to_string()))?;
-        if part.is_empty()
-            || part == "."
-            || part == ".."
-            || part.contains('/')
-            || part.contains('\\')
-        {
+        let path =
+            VPath::parse(&part).map_err(|_| Error::InvalidRemotePath(manifest.to_string()))?;
+        if path.components().len() != 1 {
             return Err(Error::InvalidRemotePath(manifest.to_string()));
         }
-        relative.push(part.as_ref());
+        relative.push(&path.components()[0]);
     }
 
     if relative.as_os_str().is_empty() {
@@ -600,6 +659,7 @@ pub enum Error {
     MissingEnvironment(String),
     NonUtf8Path(PathBuf),
     NotDirectory(PathBuf),
+    PartialFileCollision,
     Store(object_store::Error),
     SymbolicLink(PathBuf),
     TooManyFiles,
@@ -625,6 +685,9 @@ impl fmt::Display for Error {
             Self::MissingEnvironment(name) => write!(formatter, "set {name}"),
             Self::NonUtf8Path(path) => write!(formatter, "{} is not UTF-8", path.display()),
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
+            Self::PartialFileCollision => {
+                write!(formatter, "could not create a unique partial file")
+            }
             Self::Store(error) => error.fmt(formatter),
             Self::SymbolicLink(path) => {
                 write!(formatter, "refusing symbolic link: {}", path.display())
@@ -760,6 +823,56 @@ mod tests {
                 .join("nested/hello.txt.infinitefs-partial")
                 .exists()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_rejects_symbolic_link_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let source = TestDirectory::new();
+        let file = source.0.join("nested/hello.txt");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "remote").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+
+        let destination = TestDirectory::new();
+        let outside = TestDirectory::new();
+        symlink(&outside.0, destination.0.join("nested")).unwrap();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, root, &destination.0).await,
+            Err(Error::SymbolicLink(_))
+        ));
+        assert!(!outside.0.join("hello.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_delete_rejects_symbolic_link_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let destination = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let outside_file = outside.0.join("delete-me.txt");
+        fs::write(&outside_file, "keep").unwrap();
+        symlink(&outside.0, destination.0.join("nested")).unwrap();
+
+        assert!(matches!(
+            pull_deleted(&destination.0, Path::new("nested/delete-me.txt")),
+            Err(Error::SymbolicLink(_))
+        ));
+        assert_eq!(fs::read_to_string(outside_file).unwrap(), "keep");
+    }
+
+    #[test]
+    fn manifest_relative_rejects_windows_prefixes() {
+        let prefix = ObjectPath::from("root");
+        let manifest = ObjectPath::from("root/C:/victim.txt/manifest");
+
+        assert!(manifest_relative(&prefix, &manifest).is_err());
     }
 
     #[test]
