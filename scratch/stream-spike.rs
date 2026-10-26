@@ -240,12 +240,8 @@ fn receive(store: &Path, output: &Path, follow: bool) -> io::Result<()> {
                 continue;
             }
 
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-
             let directory = entry.path();
+            let name = file_name(&directory)?;
             let manifest = match read_manifest(&directory)? {
                 Some(manifest) => manifest,
                 None => continue,
@@ -544,12 +540,12 @@ mod tests {
         let data: Vec<u8> = (0..(3 * 1024 * 1024 + 12345))
             .map(|index| (index % 251) as u8)
             .collect();
-        fs::write(source.join("payload.bin"), &data).unwrap();
+        fs::write(source.join(".payload.bin"), &data).unwrap();
 
         send(&source, &store, 1024 * 1024, Duration::ZERO).unwrap();
         receive(&store, &output, false).unwrap();
 
-        assert_eq!(fs::read(output.join("payload.bin")).unwrap(), data);
+        assert_eq!(fs::read(output.join(".payload.bin")).unwrap(), data);
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -102,7 +102,8 @@ async fn pull_file(
     let (destination, parent) = pull_destination_parent(destination_root, relative)?;
     reject_symbolic_link(&destination)?;
 
-    let (partial, mut output) = create_partial_file(&parent)?;
+    let (partial_path, mut output) = create_partial_file(&parent)?;
+    let partial = PartialFile(partial_path);
     let chunks = manifest.chunk_count()?;
     let prefix = manifest_path
         .parent()
@@ -130,9 +131,13 @@ async fn pull_file(
         return Err(Error::InvalidManifest("chunk sizes do not match file size"));
     }
     output.sync_all()?;
+    drop(output);
     pull_destination_parent(destination_root, relative)?;
     reject_symbolic_link(&destination)?;
-    fs::rename(partial, destination)?;
+    if fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir()) {
+        fs::remove_dir_all(&destination)?;
+    }
+    fs::rename(&partial.0, destination)?;
     Ok(())
 }
 
@@ -228,6 +233,14 @@ fn create_partial_file(parent: &Path) -> Result<(PathBuf, fs::File), Error> {
         }
     }
     Err(Error::PartialFileCollision)
+}
+
+struct PartialFile(PathBuf);
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
@@ -1058,6 +1071,67 @@ mod tests {
             fs::read_to_string(destination.0.join(name)).unwrap(),
             "contents"
         );
+    }
+
+    #[tokio::test]
+    async fn pull_replaces_directories_with_files() {
+        let source = TestDirectory::new();
+        fs::write(source.0.join("a"), "remote file").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+
+        let destination = TestDirectory::new();
+        fs::create_dir(destination.0.join("a")).unwrap();
+        fs::write(destination.0.join("a/old"), "old").unwrap();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
+        pull_directory(&store, root, &destination.0).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.0.join("a")).unwrap(),
+            "remote file"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pull_removes_its_partial_file() {
+        let source = TestDirectory::new();
+        fs::write(source.0.join("a"), "remote file").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+        let manifest_path = object_prefix(&source.0, Path::new("a"))
+            .unwrap()
+            .join("manifest");
+        let manifest = Manifest::parse(
+            &store
+                .get(&manifest_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let chunk_path = manifest_path
+            .parent()
+            .unwrap()
+            .join("chunks")
+            .join(manifest.generation.as_deref().unwrap())
+            .join("00000000");
+        store.delete(&chunk_path).await.unwrap();
+
+        let destination = TestDirectory::new();
+        assert!(
+            pull_file(
+                &store,
+                &manifest_path,
+                &manifest,
+                &destination.0,
+                Path::new("a")
+            )
+            .await
+            .is_err()
+        );
+        assert!(fs::read_dir(&destination.0).unwrap().next().is_none());
     }
 
     #[tokio::test]
