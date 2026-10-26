@@ -68,6 +68,8 @@ async fn pull_directory(
 ) -> Result<u32, Error> {
     let prefix = ObjectPath::from(root);
     let mut objects = store.list(Some(&prefix));
+    let mut complete = Vec::new();
+    let mut deleted = Vec::new();
     let mut file_count = 0u32;
 
     while let Some(object) = objects.next().await {
@@ -79,14 +81,19 @@ async fn pull_directory(
         let manifest = Manifest::parse(&bytes)?;
         let relative = manifest_relative(&prefix, &object.location)?;
 
-        match manifest.state {
-            ManifestState::Complete => {
-                pull_file(store, &object.location, &manifest, destination, &relative).await?;
-                file_count += 1;
-            }
-            ManifestState::Deleted => pull_deleted(destination, &relative)?,
+        match &manifest.state {
+            ManifestState::Complete => complete.push((object.location, manifest, relative)),
+            ManifestState::Deleted => deleted.push(relative),
             ManifestState::Uploading => {}
         }
+    }
+
+    for relative in deleted {
+        pull_deleted(destination, &relative)?;
+    }
+    for (manifest_path, manifest, relative) in complete {
+        pull_file(store, &manifest_path, &manifest, destination, &relative).await?;
+        file_count += 1;
     }
 
     Ok(file_count)
@@ -135,14 +142,16 @@ async fn pull_file(
     pull_destination_parent(destination_root, relative)?;
     reject_symbolic_link(&destination)?;
     if fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir()) {
-        fs::remove_dir_all(&destination)?;
+        fs::remove_dir(&destination)?;
     }
     fs::rename(&partial.0, destination)?;
     Ok(())
 }
 
 fn pull_deleted(destination_root: &Path, relative: &Path) -> Result<(), Error> {
-    let (destination, _) = pull_destination_parent(destination_root, relative)?;
+    let Some(destination) = pull_existing_destination(destination_root, relative)? else {
+        return Ok(());
+    };
     match fs::symlink_metadata(&destination) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(Error::SymbolicLink(destination));
@@ -153,6 +162,43 @@ fn pull_deleted(destination_root: &Path, relative: &Path) -> Result<(), Error> {
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn pull_existing_destination(
+    destination_root: &Path,
+    relative: &Path,
+) -> Result<Option<PathBuf>, Error> {
+    let mut parent = destination_root.to_owned();
+    match fs::symlink_metadata(&parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::SymbolicLink(parent));
+        }
+        Ok(metadata) if !metadata.is_dir() => return Err(Error::NotDirectory(parent)),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
+    for component in relative.parent().unwrap_or(Path::new("")).components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(relative.to_owned()));
+        };
+        parent.push(component);
+        match fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::SymbolicLink(parent));
+            }
+            Ok(metadata) if !metadata.is_dir() => return Ok(None),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| Error::InvalidPath(relative.to_owned()))?;
+    Ok(Some(parent.join(file_name)))
 }
 
 fn pull_destination_parent(
@@ -1076,9 +1122,14 @@ mod tests {
     #[tokio::test]
     async fn pull_replaces_directories_with_files() {
         let source = TestDirectory::new();
-        fs::write(source.0.join("a"), "remote file").unwrap();
+        fs::create_dir(source.0.join("a")).unwrap();
+        fs::write(source.0.join("a/old"), "old").unwrap();
         let store = InMemory::new();
-        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+        let mut index = SyncIndex::new();
+        index.rescan(&store, &source.0).await.unwrap();
+        fs::remove_dir_all(source.0.join("a")).unwrap();
+        fs::write(source.0.join("a"), "remote file").unwrap();
+        index.rescan(&store, &source.0).await.unwrap();
 
         let destination = TestDirectory::new();
         fs::create_dir(destination.0.join("a")).unwrap();
@@ -1089,6 +1140,25 @@ mod tests {
         assert_eq!(
             fs::read_to_string(destination.0.join("a")).unwrap(),
             "remote file"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_keeps_unrelated_local_directory_files() {
+        let source = TestDirectory::new();
+        fs::write(source.0.join("a"), "remote file").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+
+        let destination = TestDirectory::new();
+        fs::create_dir(destination.0.join("a")).unwrap();
+        fs::write(destination.0.join("a/notes.txt"), "local").unwrap();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
+
+        assert!(pull_directory(&store, root, &destination.0).await.is_err());
+        assert_eq!(
+            fs::read_to_string(destination.0.join("a/notes.txt")).unwrap(),
+            "local"
         );
     }
 
