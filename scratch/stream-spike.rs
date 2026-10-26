@@ -281,6 +281,9 @@ fn receive(store: &Path, output: &Path, follow: bool) -> io::Result<()> {
                 .get_mut(&name)
                 .ok_or_else(|| invalid_data("receiver file state is missing"))?;
 
+            if manifest.chunk_size == 0 {
+                return Err(invalid_input(format!("{name}: chunk size must be positive")));
+            }
             if manifest.chunk_size != state.chunk_size {
                 return Err(invalid_input(format!(
                     "{name}: chunk size changed during transfer"
@@ -310,10 +313,18 @@ fn receive(store: &Path, output: &Path, follow: bool) -> io::Result<()> {
                     Err(error) => return Err(error),
                 };
 
-                let remaining = (manifest.size - state.read_bytes) as usize;
-                let take = remaining.min(bytes.len());
-                state.output.write_all(&bytes[..take])?;
-                state.read_bytes += take as u64;
+                let remaining = usize::try_from(manifest.size - state.read_bytes)
+                    .map_err(|_| invalid_input(format!("{name}: remaining size is too large")))?;
+                let chunk_size = usize::try_from(manifest.chunk_size)
+                    .map_err(|_| invalid_input(format!("{name}: chunk size is too large")))?;
+                let expected = remaining.min(chunk_size);
+                if bytes.len() != expected {
+                    return Err(invalid_input(format!(
+                        "{name}: chunk {chunk_index} has an invalid length"
+                    )));
+                }
+                state.output.write_all(&bytes)?;
+                state.read_bytes += bytes.len() as u64;
 
                 if state.first_byte_ms.is_none() {
                     state.first_byte_ms = Some(now_milliseconds().saturating_sub(state.started_at));
@@ -359,7 +370,7 @@ fn receive(store: &Path, output: &Path, follow: bool) -> io::Result<()> {
         }
 
         let every_file_complete = !files.is_empty() && files.values().all(|file| file.complete);
-        if every_file_complete {
+        if every_file_complete && !follow {
             break;
         }
         if !follow && (!saw_any || active == 0) {

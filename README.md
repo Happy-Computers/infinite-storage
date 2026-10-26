@@ -34,19 +34,18 @@ A cloud filesystem that's infinitely scalable for humans and agents alike.
  contents and extensions do not change the upload behavior. It skips symbolic links and ignores
  common editor temporary files, and publishes a deleted manifest when a watched file disappears.
  
--Omit `--watch` to upload the directory once. Downloading files and resolving conflicts are not
-+Omit `--watch` to upload the directory once.
-+
-+## Pull a directory from S3
-+
-+To restore a synced root into a different local directory, run:
-+
-+```bash
-+cargo run --release -- pull infinitefs-demo /tmp/infinitefs-pulled
-+```
-+
-+`pull` reads only complete manifests. It streams their chunks into temporary files and renames each
-+file after the published byte count matches. Download watching and conflict resolution are not
+Omit `--watch` to upload the directory once.
+
+## Pull a directory from S3
+
+To restore a synced root into a different local directory, run:
+
+```bash
+cargo run --release -- pull infinitefs-demo /tmp/infinitefs-pulled
+```
+
+`pull` reads only complete manifests. It streams their chunks into temporary files and renames each
+file after the published byte count matches. Download watching and conflict resolution are not
  implemented yet.
  
 ## Requirements
