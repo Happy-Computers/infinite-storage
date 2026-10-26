@@ -304,7 +304,7 @@ fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
 struct Manifest {
     chunk_size: u64,
     generation: Option<String>,
-    modified_ns: Option<u64>,
+    modified_ns: Option<i128>,
     size: u64,
     state: ManifestState,
 }
@@ -326,7 +326,14 @@ impl Manifest {
             match key {
                 "chunk_size" => chunk_size = Some(parse_manifest_number(value)?),
                 "generation" => generation = Some(parse_generation(value)?),
-                "modified_ns" => modified_ns = Some(parse_manifest_number(value)?),
+                "modified_ns" => modified_ns = Some(i128::from(parse_manifest_number(value)?)),
+                "modified_ns_signed" => {
+                    modified_ns = Some(
+                        value
+                            .parse()
+                            .map_err(|_| Error::InvalidManifest("manifest timestamp is invalid"))?,
+                    )
+                }
                 "size" => size = Some(parse_manifest_number(value)?),
                 "state" => state = Some(ManifestState::parse(value)?),
                 _ => {}
@@ -535,8 +542,11 @@ impl SyncIndex {
             let manifest = Manifest::parse(&store.get(&object.location).await?.bytes().await?)?;
             if matches!(manifest.state, ManifestState::Complete) {
                 let path = source.join(manifest_relative(&prefix, &object.location)?);
-                if manifest_matches_file(&manifest, &path) {
-                    files.insert(path.clone(), file_snapshot(&path)?);
+                if let Ok(snapshot) = file_snapshot(&path)
+                    && snapshot.length == manifest.size
+                    && manifest.modified_ns == Some(snapshot.modified_ns)
+                {
+                    files.insert(path.clone(), snapshot);
                 }
                 remote_files.insert(path);
             }
@@ -743,7 +753,10 @@ async fn put_manifest(
         .map(|value| format!("generation={value}\n"))
         .unwrap_or_default();
     let modified_ns = snapshot
-        .map(|value| format!("modified_ns={}\n", value.modified_ns))
+        .map(|value| match u64::try_from(value.modified_ns) {
+            Ok(timestamp) => format!("modified_ns={timestamp}\n"),
+            Err(_) => format!("modified_ns_signed={}\n", value.modified_ns),
+        })
         .unwrap_or_default();
     let manifest = format!(
         "version=2\nsize={confirmed_size}\nchunk_size={CHUNK_SIZE}\n{generation}{modified_ns}state={state}\n"
@@ -859,32 +872,20 @@ fn read_chunk(reader: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileSnapshot {
     length: u64,
-    modified_ns: u64,
+    modified_ns: i128,
 }
 
 fn file_snapshot(path: &Path) -> io::Result<FileSnapshot> {
     let metadata = fs::metadata(path)?;
-    let modified_ns = metadata
-        .modified()?
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file time precedes epoch"))?
-        .as_nanos()
-        .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file time is too large"))?;
+    let modified_ns = match metadata.modified()?.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().try_into(),
+        Err(error) => i128::try_from(error.duration().as_nanos()).map(|value| -value),
+    }
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file time is too large"))?;
     Ok(FileSnapshot {
         length: metadata.len(),
         modified_ns,
     })
-}
-
-fn manifest_matches_file(manifest: &Manifest, path: &Path) -> bool {
-    let Some(modified_ns) = manifest.modified_ns else {
-        return false;
-    };
-    match file_snapshot(path) {
-        Ok(snapshot) => snapshot.length == manifest.size && snapshot.modified_ns == modified_ns,
-        Err(_) => false,
-    }
 }
 
 #[derive(Debug)]
@@ -1065,6 +1066,45 @@ mod tests {
         index.rescan(&store, &source.0).await.unwrap();
 
         assert_eq!(manifest(&store, &source.0, "package.json").await, before);
+    }
+
+    #[tokio::test]
+    async fn syncs_files_dated_before_the_unix_epoch() {
+        let source = TestDirectory::new();
+        let file = source.0.join("archive.txt");
+        fs::write(&file, "old").unwrap();
+        let time = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        fs::File::open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(time))
+            .unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+
+        index.rescan(&store, &source.0).await.unwrap();
+        let before = manifest(&store, &source.0, "archive.txt").await;
+        assert!(before.contains("modified_ns_signed=-1000000000\n"));
+        assert!(!before.contains("modified_ns=-"));
+
+        let mut restarted = SyncIndex::load(&store, &source.0).await.unwrap();
+        restarted.rescan(&store, &source.0).await.unwrap();
+        assert_eq!(manifest(&store, &source.0, "archive.txt").await, before);
+    }
+
+    #[test]
+    fn manifest_accepts_signed_and_legacy_large_timestamps() {
+        for (key, timestamp) in [
+            ("modified_ns_signed", "-1000000000"),
+            ("modified_ns", "18446744073709551615"),
+        ] {
+            let text = format!(
+                "version=2\nsize=1\nchunk_size={CHUNK_SIZE}\n{key}={timestamp}\nstate=complete\n"
+            );
+            assert_eq!(
+                Manifest::parse(text.as_bytes()).unwrap().modified_ns,
+                Some(timestamp.parse::<i128>().unwrap())
+            );
+        }
     }
 
     #[cfg(unix)]
