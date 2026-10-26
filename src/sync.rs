@@ -102,10 +102,7 @@ async fn pull_file(
     let (destination, parent) = pull_destination_parent(destination_root, relative)?;
     reject_symbolic_link(&destination)?;
 
-    let file_name = destination
-        .file_name()
-        .ok_or_else(|| Error::InvalidPath(destination.clone()))?;
-    let (partial, mut output) = create_partial_file(&parent, file_name)?;
+    let (partial, mut output) = create_partial_file(&parent)?;
     let chunks = manifest.chunk_count()?;
     let prefix = manifest_path
         .parent()
@@ -175,36 +172,50 @@ fn pull_destination_parent(
 }
 
 fn ensure_directory(path: &Path) -> Result<(), Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(Error::SymbolicLink(path.to_owned()))
-        }
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(Error::NotDirectory(path.to_owned())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            match fs::symlink_metadata(path)? {
-                metadata if metadata.file_type().is_symlink() => {
-                    Err(Error::SymbolicLink(path.to_owned()))
-                }
-                metadata if metadata.is_dir() => Ok(()),
-                _ => Err(Error::NotDirectory(path.to_owned())),
+    let mut missing = Vec::new();
+    let mut current = path;
+
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::SymbolicLink(current.to_owned()));
             }
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => return Err(Error::NotDirectory(current.to_owned())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_owned());
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                if parent.as_os_str().is_empty() {
+                    break;
+                }
+                current = parent;
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => Err(error.into()),
     }
+
+    for directory in missing.iter().rev() {
+        fs::create_dir(directory)?;
+        let metadata = fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::SymbolicLink(directory.to_owned()));
+        }
+        if !metadata.is_dir() {
+            return Err(Error::NotDirectory(directory.to_owned()));
+        }
+    }
+
+    Ok(())
 }
 
-fn create_partial_file(
-    parent: &Path,
-    file_name: &std::ffi::OsStr,
-) -> Result<(PathBuf, fs::File), Error> {
+fn create_partial_file(parent: &Path) -> Result<(PathBuf, fs::File), Error> {
     for _ in 0..1024 {
         let sequence = PARTIAL_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let partial = parent.join(format!(
-            ".{}.infinitefs-partial-{}-{sequence}",
-            file_name.to_string_lossy(),
-            std::process::id(),
+            ".infinitefs-partial-{}-{sequence}",
+            std::process::id()
         ));
         match fs::OpenOptions::new()
             .create_new(true)
@@ -313,12 +324,10 @@ fn manifest_relative(prefix: &ObjectPath, manifest: &ObjectPath) -> Result<PathB
         let part = percent_decode_str(part.as_ref())
             .decode_utf8()
             .map_err(|_| Error::InvalidRemotePath(manifest.to_string()))?;
-        let path =
-            VPath::parse(&part).map_err(|_| Error::InvalidRemotePath(manifest.to_string()))?;
-        if path.components().len() != 1 {
+        if part.is_empty() || part == "." || part == ".." || part.contains(['/', '\\', ':']) {
             return Err(Error::InvalidRemotePath(manifest.to_string()));
         }
-        relative.push(&path.components()[0]);
+        relative.push(part.as_ref());
     }
 
     if relative.as_os_str().is_empty() {
@@ -478,6 +487,8 @@ impl SyncIndex {
     async fn rescan(&mut self, store: &dyn ObjectStore, source: &Path) -> Result<(), Error> {
         let current = regular_files(source)?;
         let mut seen = HashMap::new();
+        let mut changed_paths = HashSet::new();
+        let mut changed_path = None;
 
         for path in current {
             let snapshot = match file_snapshot(&path) {
@@ -491,7 +502,8 @@ impl SyncIndex {
                         seen.insert(path, snapshot);
                     }
                     Err(Error::ChangedDuringUpload(_)) => {
-                        return Err(Error::ChangedDuringUpload(path));
+                        changed_paths.insert(path.clone());
+                        changed_path.get_or_insert(path);
                     }
                     Err(error) => return Err(error),
                 }
@@ -506,14 +518,17 @@ impl SyncIndex {
             .chain(self.files.keys())
             .collect::<HashSet<_>>();
         for path in previous {
-            if !seen.contains_key(path) {
+            if !seen.contains_key(path) && !changed_paths.contains(path) {
                 put_tombstone(store, source, path).await?;
             }
         }
 
-        self.remote_files = seen.keys().cloned().collect();
+        self.remote_files = seen.keys().chain(changed_paths.iter()).cloned().collect();
         self.files = seen;
-        Ok(())
+        match changed_path {
+            Some(path) => Err(Error::ChangedDuringUpload(path)),
+            None => Ok(()),
+        }
     }
 
     async fn apply_paths(
@@ -1008,6 +1023,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pulls_dotfiles_into_nested_destinations() {
+        let source = TestDirectory::new();
+        let file = source.0.join(".gitignore");
+        fs::write(&file, "target\n").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+
+        let destination = TestDirectory::new().0.join("missing/parents/root");
+        let root = source.0.file_name().unwrap().to_str().unwrap();
+        pull_directory(&store, root, &destination).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join(".gitignore")).unwrap(),
+            "target\n"
+        );
+        assert!(SyncIndex::load(&store, &source.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pulls_maximum_length_filenames() {
+        let source = TestDirectory::new();
+        let name = "a".repeat(255);
+        let file = source.0.join(&name);
+        fs::write(&file, "contents").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+
+        let destination = TestDirectory::new();
+        let root = source.0.file_name().unwrap().to_str().unwrap();
+        pull_directory(&store, root, &destination.0).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.0.join(name)).unwrap(),
+            "contents"
+        );
+    }
+
+    #[tokio::test]
     async fn pull_uses_the_generation_named_by_its_manifest() {
         let source = TestDirectory::new();
         let file = source.0.join("hello.txt");
@@ -1111,6 +1164,17 @@ mod tests {
         let manifest = ObjectPath::from("root/C:/victim.txt/manifest");
 
         assert!(manifest_relative(&prefix, &manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_relative_accepts_dotfiles() {
+        let prefix = ObjectPath::from("root");
+        let manifest = ObjectPath::from("root/.gitignore/manifest");
+
+        assert_eq!(
+            manifest_relative(&prefix, &manifest).unwrap(),
+            Path::new(".gitignore")
+        );
     }
 
     #[test]
