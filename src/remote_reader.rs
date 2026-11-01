@@ -406,6 +406,16 @@ impl RemoteFileReader {
             path = path.join(generation.as_str());
         }
         path = path.join(format!("{index:08}"));
+        let offset = index
+            .checked_mul(self.manifest.chunk_size)
+            .ok_or_else(|| ReaderError::InvalidManifest("chunk offset overflow".into()))?;
+        let remaining = self
+            .manifest
+            .size
+            .checked_sub(offset)
+            .filter(|_| offset < self.manifest.size)
+            .ok_or_else(|| ReaderError::InvalidManifest("chunk index exceeds file size".into()))?;
+        let expected_size = self.manifest.chunk_size.min(remaining);
         #[cfg(test)]
         let gate = lock_mutex(&self.fetch_gates).get(&index).cloned();
         #[cfg(test)]
@@ -423,29 +433,17 @@ impl RemoteFileReader {
         tokio::task::yield_now().await;
         #[cfg(test)]
         self.test_changed.notify_waiters();
-        let fetched = match self.store.get(&path).await {
+        match self.store.get(&path).await {
             Ok(result) => {
                 #[cfg(test)]
                 let result = self.gate_body_read(index, result);
-                result
-                    .bytes()
-                    .await
-                    .map_err(|error| ReaderError::Store(Arc::new(error)))
+                read_chunk_body(result, expected_size, path.to_string()).await
             }
             Err(object_store::Error::NotFound { .. }) => {
                 Err(ReaderError::MissingChunk(path.to_string()))
             }
             Err(error) => Err(ReaderError::Store(Arc::new(error))),
-        };
-        let bytes = fetched?;
-        let offset = index
-            .checked_mul(self.manifest.chunk_size)
-            .ok_or_else(|| ReaderError::InvalidManifest("chunk offset overflow".into()))?;
-        let expected = self.manifest.chunk_size.min(self.manifest.size - offset);
-        if bytes.len() as u64 != expected {
-            return Err(ReaderError::InvalidChunk(path.to_string()));
         }
-        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -527,6 +525,33 @@ impl RemoteFileReader {
         self.paused_waiters.fetch_sub(1, Ordering::SeqCst);
         self.test_changed.notify_waiters();
     }
+}
+
+async fn read_chunk_body(
+    result: object_store::GetResult,
+    expected_size: u64,
+    path: String,
+) -> Result<Bytes, ReaderError> {
+    if result.meta.size != expected_size {
+        return Err(ReaderError::InvalidChunk(path));
+    }
+
+    let expected_size =
+        usize::try_from(expected_size).map_err(|_| ReaderError::InvalidChunk(path.clone()))?;
+    let mut body = Vec::with_capacity(expected_size);
+    let mut stream = result.into_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| ReaderError::Store(Arc::new(error)))?;
+        if chunk.len() > expected_size - body.len() {
+            return Err(ReaderError::InvalidChunk(path));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    if body.len() != expected_size {
+        return Err(ReaderError::InvalidChunk(path));
+    }
+    Ok(Bytes::from(body))
 }
 
 async fn read_manifest_body(result: object_store::GetResult) -> Result<Bytes, ReaderError> {
@@ -623,6 +648,116 @@ mod tests {
         (reader, store, manifest)
     }
 
+    async fn chunk_result(actual: &[u8], advertised_size: u64) -> object_store::GetResult {
+        let store = InMemory::new();
+        let path = ObjectPath::from("test/chunk");
+        store
+            .put(&path, Bytes::copy_from_slice(actual).into())
+            .await
+            .unwrap();
+        let mut result = store.get(&path).await.unwrap();
+        result.meta.size = advertised_size;
+        result
+    }
+
+    fn set_stream_body(result: &mut object_store::GetResult, chunks: Vec<Bytes>) {
+        result.payload = object_store::GetResultPayload::Stream(
+            futures_util::stream::iter(chunks.into_iter().map(Ok::<_, object_store::Error>))
+                .boxed(),
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_advertised_oversized_chunk_before_reading_body() {
+        let mut result = chunk_result(b"data", 5).await;
+        result.payload = object_store::GetResultPayload::Stream(
+            futures_util::stream::once(async {
+                panic!("oversized chunk body must not be read");
+                #[allow(unreachable_code)]
+                Ok(Bytes::new())
+            })
+            .boxed(),
+        );
+
+        assert!(matches!(
+            read_chunk_body(result, 4, "chunk".into()).await,
+            Err(ReaderError::InvalidChunk(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_incorrect_advertised_chunk_size_before_reading_body() {
+        let mut result = chunk_result(b"data", 3).await;
+        result.payload = object_store::GetResultPayload::Stream(
+            futures_util::stream::once(async {
+                panic!("incorrectly advertised chunk body must not be read");
+                #[allow(unreachable_code)]
+                Ok(Bytes::new())
+            })
+            .boxed(),
+        );
+
+        assert!(matches!(
+            read_chunk_body(result, 4, "chunk".into()).await,
+            Err(ReaderError::InvalidChunk(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_chunk_body_while_streaming() {
+        let mut result = chunk_result(b"data", 4).await;
+        let polled = Arc::new(AtomicUsize::new(0));
+        let body = futures_util::stream::iter([
+            Ok::<_, object_store::Error>(Bytes::from_static(b"data")),
+            Ok(Bytes::from_static(b"x")),
+            Ok(Bytes::from_static(b"must not be read")),
+        ])
+        .map({
+            let polled = polled.clone();
+            move |chunk| {
+                polled.fetch_add(1, Ordering::SeqCst);
+                chunk
+            }
+        })
+        .boxed();
+        result.payload = object_store::GetResultPayload::Stream(body);
+
+        assert!(matches!(
+            read_chunk_body(result, 4, "chunk".into()).await,
+            Err(ReaderError::InvalidChunk(_))
+        ));
+        assert_eq!(polled.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_undersized_chunk_body() {
+        let mut result = chunk_result(b"data", 4).await;
+        set_stream_body(&mut result, vec![Bytes::from_static(b"dat")]);
+
+        assert!(matches!(
+            read_chunk_body(result, 4, "chunk".into()).await,
+            Err(ReaderError::InvalidChunk(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepts_normal_and_final_partial_chunk_bodies() {
+        let normal = chunk_result(b"data", 4).await;
+        assert_eq!(
+            read_chunk_body(normal, 4, "chunk".into()).await.unwrap(),
+            Bytes::from_static(b"data")
+        );
+
+        let mut final_partial = chunk_result(b"end", 3).await;
+        set_stream_body(&mut final_partial, vec![Bytes::from_static(b"end")]);
+        assert_eq!(
+            read_chunk_body(final_partial, 3, "chunk".into())
+                .await
+                .unwrap(),
+            Bytes::from_static(b"end")
+        );
+    }
+
     #[tokio::test]
     async fn reads_ranges_and_eof() {
         let data: Vec<u8> = (0..CHUNK * 2 + 37)
@@ -693,6 +828,12 @@ mod tests {
             reader.read_at(0, &mut output).await,
             Err(ReaderError::InvalidChunk(_))
         ));
+        assert!(!lock_state(&reader.cache).chunks.contains_key(&0));
+        assert!(matches!(
+            reader.read_at(0, &mut output).await,
+            Err(ReaderError::InvalidChunk(_))
+        ));
+        assert_eq!(reader.get_count.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
