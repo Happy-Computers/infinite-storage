@@ -405,18 +405,19 @@ fn reject_symbolic_link(path: &Path) -> Result<(), Error> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Manifest {
-    chunk_size: u64,
-    generation: Option<String>,
+pub(crate) struct Manifest {
+    pub(crate) chunk_size: u64,
+    pub(crate) generation: Option<String>,
     modified_ns: Option<i128>,
-    size: u64,
-    state: ManifestState,
+    pub(crate) size: u64,
+    pub(crate) state: ManifestState,
 }
 
 impl Manifest {
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| Error::InvalidManifest("manifest is not UTF-8"))?;
+        let mut version_seen = false;
         let mut chunk_size = None;
         let mut generation = None;
         let mut modified_ns = None;
@@ -428,22 +429,56 @@ impl Manifest {
                 continue;
             };
             match key {
-                "chunk_size" => chunk_size = Some(parse_manifest_number(value)?),
-                "generation" => generation = Some(parse_generation(value)?),
-                "modified_ns" => modified_ns = Some(i128::from(parse_manifest_number(value)?)),
+                "version" => {
+                    if version_seen {
+                        return Err(Error::InvalidManifest(
+                            "manifest contains a duplicate version field",
+                        ));
+                    }
+                    if !matches!(value, "1" | "2") {
+                        return Err(Error::InvalidManifest("manifest version is unsupported"));
+                    }
+                    version_seen = true;
+                }
+                "chunk_size" => set_manifest_field(
+                    &mut chunk_size,
+                    parse_manifest_number(value)?,
+                    "manifest contains a duplicate chunk_size field",
+                )?,
+                "generation" => set_manifest_field(
+                    &mut generation,
+                    parse_generation(value)?,
+                    "manifest contains a duplicate generation field",
+                )?,
+                "modified_ns" => set_manifest_field(
+                    &mut modified_ns,
+                    i128::from(parse_manifest_number(value)?),
+                    "manifest contains duplicate timestamp fields",
+                )?,
                 "modified_ns_signed" => {
-                    modified_ns = Some(
+                    set_manifest_field(
+                        &mut modified_ns,
                         value
                             .parse()
                             .map_err(|_| Error::InvalidManifest("manifest timestamp is invalid"))?,
-                    )
+                        "manifest contains duplicate timestamp fields",
+                    )?;
                 }
-                "size" => size = Some(parse_manifest_number(value)?),
-                "state" => state = Some(ManifestState::parse(value)?),
+                "size" => set_manifest_field(
+                    &mut size,
+                    parse_manifest_number(value)?,
+                    "manifest contains a duplicate size field",
+                )?,
+                "state" => set_manifest_field(
+                    &mut state,
+                    ManifestState::parse(value)?,
+                    "manifest contains a duplicate state field",
+                )?,
                 _ => {}
             }
         }
 
+        // The previous parser accepted manifests without a version. Preserve them as legacy input.
         let chunk_size =
             chunk_size.ok_or(Error::InvalidManifest("manifest is missing chunk_size"))?;
         if chunk_size != CHUNK_SIZE as u64 {
@@ -468,7 +503,7 @@ impl Manifest {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ManifestState {
+pub(crate) enum ManifestState {
     Complete,
     Deleted,
     Uploading,
@@ -514,6 +549,18 @@ fn parse_manifest_number(value: &str) -> Result<u64, Error> {
     value
         .parse()
         .map_err(|_| Error::InvalidManifest("manifest number is invalid"))
+}
+
+fn set_manifest_field<T>(
+    field: &mut Option<T>,
+    value: T,
+    duplicate_error: &'static str,
+) -> Result<(), Error> {
+    if field.is_some() {
+        return Err(Error::InvalidManifest(duplicate_error));
+    }
+    *field = Some(value);
+    Ok(())
 }
 
 fn parse_generation(value: &str) -> Result<String, Error> {
@@ -1359,7 +1406,10 @@ mod tests {
         let file = source.0.join("archive.txt");
         fs::write(&file, "old").unwrap();
         let time = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
-        fs::File::open(&file)
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(time))
             .unwrap();
@@ -1390,6 +1440,77 @@ mod tests {
                 Some(timestamp.parse::<i128>().unwrap())
             );
         }
+    }
+
+    #[test]
+    fn manifest_accepts_current_and_legacy_versions() {
+        let current = format!(
+            "state=complete\ngeneration=generation-2\nchunk_size={CHUNK_SIZE}\nsize=1\nversion=2\n"
+        );
+        let legacy_v1 = format!("version=1\nsize=1\nchunk_size={CHUNK_SIZE}\nstate=complete\n");
+        let legacy_unversioned = format!("size=1\nchunk_size={CHUNK_SIZE}\nstate=complete\n");
+
+        for manifest in [current, legacy_v1, legacy_unversioned] {
+            assert_eq!(Manifest::parse(manifest.as_bytes()).unwrap().size, 1);
+        }
+    }
+
+    #[test]
+    fn manifest_rejects_unsupported_and_malformed_versions() {
+        for version in ["3", "", "v2", "2.0", " 2", "-1"] {
+            let manifest =
+                format!("version={version}\nsize=1\nchunk_size={CHUNK_SIZE}\nstate=complete\n");
+            assert!(matches!(
+                Manifest::parse(manifest.as_bytes()),
+                Err(Error::InvalidManifest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_recognized_fields() {
+        let valid = format!(
+            "version=2\nsize=1\nchunk_size={CHUNK_SIZE}\ngeneration=generation-1\
+             \nmodified_ns=1\nstate=complete\n"
+        );
+        let duplicate_fields = [
+            ("version=2\n".to_owned(), "version=2\n".to_owned()),
+            ("size=1\n".to_owned(), "size=1\n".to_owned()),
+            (
+                format!("chunk_size={CHUNK_SIZE}\n"),
+                format!("chunk_size={CHUNK_SIZE}\n"),
+            ),
+            (
+                "generation=generation-1\n".to_owned(),
+                "generation=generation-1\n".to_owned(),
+            ),
+            ("modified_ns=1\n".to_owned(), "modified_ns=2\n".to_owned()),
+            ("state=complete\n".to_owned(), "state=complete\n".to_owned()),
+        ];
+        for (field, duplicate) in duplicate_fields {
+            let duplicate_manifest = valid.replacen(&field, &format!("{field}{duplicate}"), 1);
+            assert!(matches!(
+                Manifest::parse(duplicate_manifest.as_bytes()),
+                Err(Error::InvalidManifest(_))
+            ));
+        }
+
+        let duplicate_timestamp_alias =
+            valid.replace("modified_ns=1\n", "modified_ns=1\nmodified_ns_signed=1\n");
+        assert!(matches!(
+            Manifest::parse(duplicate_timestamp_alias.as_bytes()),
+            Err(Error::InvalidManifest(_))
+        ));
+
+        let signed_timestamp = valid.replace("modified_ns=1\n", "modified_ns_signed=1\n");
+        let duplicate_signed_timestamp = signed_timestamp.replace(
+            "modified_ns_signed=1\n",
+            "modified_ns_signed=1\nmodified_ns_signed=2\n",
+        );
+        assert!(matches!(
+            Manifest::parse(duplicate_signed_timestamp.as_bytes()),
+            Err(Error::InvalidManifest(_))
+        ));
     }
 
     #[cfg(unix)]
