@@ -2,6 +2,7 @@
 name = "infinitefs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 
 [dependencies]
 bytes = "1"

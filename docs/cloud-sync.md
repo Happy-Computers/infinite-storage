@@ -34,13 +34,55 @@ The current key layout is:
 
 ```
 <synced-root>/<relative-file-path>/manifest
-<synced-root>/<relative-file-path>/chunks/00000000
-<synced-root>/<relative-file-path>/chunks/00000001
+<synced-root>/<relative-file-path>/chunks/<generation>/<8-digit-index>
 ```
+
+For example:
+
+```text
+MyFolder/
+└── video.mp4/
+    ├── manifest
+    └── chunks/
+        └── <generation>/
+            ├── 00000000
+            └── 00000001
+```
+
+Current uploads create a new generation and record it in the manifest. Pull also accepts legacy
+manifests without a generation; their chunks use
+`<synced-root>/<relative-file-path>/chunks/<8-digit-index>`. Generation-less chunk paths are a
+compatibility path, not the current upload layout.
 
 The manifest contains the number of confirmed bytes, the fixed chunk size, and `uploading`,
 `complete`, or `deleted`. `infinitefs pull <root> <directory>` restores complete manifests by
 streaming chunks into a temporary file and then renaming the verified file into place.
+
+## Portable filenames
+
+InfiniteFS applies one filename policy before upload and pull so a key created on one supported
+operating system can be represented on Windows, Linux, and macOS. Components may contain printable
+ASCII except Windows path characters (`< > : " / \\ | ? *`); object-store percent encoding is
+preserved and round-trips. Components cannot be empty, `.` or `..`, exceed the InfiniteFS virtual
+limit of 255 bytes, begin with a space, or end in a dot or space. This component limit does not
+guarantee that every destination filesystem accepts that length or that the complete path fits its
+total path limit. Windows device names such as `CON`, `NUL`, `COM1`, `CONIN$`, and `CONOUT$` are
+reserved. Dotfiles such as `.env`, `.gitignore`, and `.config` are valid. Interior spaces are valid.
+
+InfiniteFS currently accepts ASCII-only virtual filename components. This avoids Unicode
+normalization differences across filesystems, but means some legal POSIX filenames cannot be
+synced. The policy fails closed for the entire operation rather than skipping one unsupported file.
+A Complete manifest with a UTF-8 Unicode path makes `SyncIndex::load` fail, so unrelated ASCII files
+under the same S3 root may not sync and watcher startup may fail before its initial rescan.
+
+During pull, one unsupported Unicode manifest path aborts the entire pull; InfiniteFS does not skip
+only that manifest. Pull validates manifest paths and the destination plan before applying
+tombstones, downloading files, or otherwise mutating the local destination. It does not normalize,
+rename, or delete the unsupported S3 key. This is a temporary, breaking compatibility restriction:
+use a version with compatible Unicode filename support or a separate export to retrieve those
+files. A case-insensitive collision in an upload scan, remote manifest set, or existing pull
+destination is likewise reported before that operation writes data; names are never silently
+mapped to a different spelling.
 
 ## The hard constraint
 
@@ -172,7 +214,9 @@ becomes `"complete"` and `size` is final.
 
 ### Scope limits for v1
 
-- Regular files only. No symlinks (already rejected by `VPath`), sockets, or devices.
+- Regular files only. No symlinks, sockets, or devices. `VPath` validates virtual path strings and
+  components; filesystem metadata checks detect symlinks during relevant source and destination
+  operations. These checks do not claim to reject every possible Windows reparse-point type.
 - No directory objects. Directories are implied by keys, like S3 does.
 - No POSIX permissions, xattrs, or hard links.
 - Ignore the app's own state/cache directory, editor temp files (`*.swp`, `*~`, `.#*`), and

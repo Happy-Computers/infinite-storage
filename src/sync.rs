@@ -96,6 +96,7 @@ async fn pull_directory_with_concurrency(
 
     let mut complete = Vec::new();
     let mut deleted = Vec::new();
+    let mut manifest_relatives = Vec::new();
     let prefix = &prefix;
     let mut manifests = futures_util::stream::iter(manifest_paths)
         .map(|path| async move {
@@ -108,6 +109,7 @@ async fn pull_directory_with_concurrency(
 
     while let Some(manifest) = manifests.next().await {
         let (path, manifest, relative) = manifest?;
+        manifest_relatives.push(relative.clone());
         match &manifest.state {
             ManifestState::Complete => complete.push((path, manifest, relative)),
             ManifestState::Deleted => deleted.push(relative),
@@ -115,21 +117,18 @@ async fn pull_directory_with_concurrency(
         }
     }
 
+    let remote_paths = manifest_relatives
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
     let complete_paths = complete
         .iter()
         .map(|(_, _, relative): &(_, _, PathBuf)| relative.as_path())
         .collect::<HashSet<_>>();
-    for relative in deleted {
-        pull_deleted(destination, &relative)?;
-        let mut ancestor = relative.parent();
-        while let Some(parent) = ancestor {
-            if complete_paths.contains(parent) {
-                pull_prune_empty_ancestors(destination, &relative, parent)?;
-                break;
-            }
-            ancestor = parent.parent();
-        }
-    }
+    validate_portable_path_set(remote_paths.iter().copied())?;
+    validate_file_path_ancestors(complete_paths.iter().copied())?;
+    validate_destination_collisions(destination, &remote_paths)?;
+    pull_directory_apply_tombstones(destination, &deleted, &complete_paths)?;
     let mut downloaded = Vec::new();
     let mut pulls = futures_util::stream::iter(complete)
         .map(|(path, manifest, relative)| async move {
@@ -146,6 +145,28 @@ async fn pull_directory_with_concurrency(
         file_count,
         newer_version_available: newer_complete_manifests(store, &downloaded, concurrency).await?,
     })
+}
+
+fn pull_directory_apply_tombstones(
+    destination: &Path,
+    deleted: &[PathBuf],
+    complete_paths: &HashSet<&Path>,
+) -> Result<(), Error> {
+    let deleted_paths = deleted.iter().map(PathBuf::as_path).collect::<HashSet<_>>();
+    validate_destination_structure(destination, complete_paths, &deleted_paths)?;
+
+    for relative in deleted {
+        pull_deleted(destination, relative)?;
+        let mut ancestor = relative.parent();
+        while let Some(parent) = ancestor {
+            if complete_paths.contains(parent) {
+                pull_prune_empty_ancestors(destination, relative, parent)?;
+                break;
+            }
+            ancestor = parent.parent();
+        }
+    }
+    Ok(())
 }
 
 async fn newer_complete_manifests(
@@ -527,22 +548,22 @@ fn manifest_relative(prefix: &ObjectPath, manifest: &ObjectPath) -> Result<PathB
     let parts = manifest_parent
         .prefix_match(prefix)
         .ok_or_else(|| Error::InvalidRemotePath(manifest.to_string()))?;
-    let mut relative = PathBuf::new();
+    let mut components = Vec::new();
 
     for part in parts {
         let part = percent_decode_str(part.as_ref())
             .decode_utf8()
             .map_err(|_| Error::InvalidRemotePath(manifest.to_string()))?;
-        if part.is_empty() || part == "." || part == ".." || part.contains(['/', '\\', ':']) {
+        if part.contains(['/', '\\']) {
             return Err(Error::InvalidRemotePath(manifest.to_string()));
         }
-        relative.push(part.as_ref());
+        if !part.is_ascii() {
+            return Err(Error::UnsupportedRemoteFilename(manifest.to_string()));
+        }
+        components.push(part.into_owned());
     }
 
-    if relative.as_os_str().is_empty() {
-        return Err(Error::InvalidRemotePath(manifest.to_string()));
-    }
-    Ok(relative)
+    portable_path(&components.join("/")).map_err(|_| Error::InvalidRemotePath(manifest.to_string()))
 }
 
 fn parse_manifest_number(value: &str) -> Result<u64, Error> {
@@ -684,6 +705,7 @@ impl SyncIndex {
         let mut objects = store.list(Some(&prefix));
         let mut files = HashMap::new();
         let mut remote_files = HashSet::new();
+        let mut remote_relatives = Vec::new();
 
         while let Some(object) = objects.next().await {
             let object = object?;
@@ -692,7 +714,9 @@ impl SyncIndex {
             }
             let manifest = Manifest::parse(&store.get(&object.location).await?.bytes().await?)?;
             if matches!(manifest.state, ManifestState::Complete) {
-                let path = source.join(manifest_relative(&prefix, &object.location)?);
+                let relative = manifest_relative(&prefix, &object.location)?;
+                remote_relatives.push(relative.clone());
+                let path = source.join(relative);
                 if let Ok(snapshot) = file_snapshot(&path)
                     && snapshot.length == manifest.size
                     && manifest.modified_ns == Some(snapshot.modified_ns)
@@ -702,6 +726,8 @@ impl SyncIndex {
                 remote_files.insert(path);
             }
         }
+        validate_portable_path_set(remote_relatives.iter().map(PathBuf::as_path))?;
+        validate_file_path_ancestors(remote_relatives.iter().map(PathBuf::as_path))?;
 
         Ok(Self {
             files,
@@ -726,6 +752,7 @@ impl SyncIndex {
     ) -> Result<(), Error> {
         assert!(concurrency > 0);
         let current = regular_files(source)?;
+        validate_source_paths(source, &current)?;
         let mut seen = HashMap::new();
         let mut changed_paths = HashSet::new();
         let mut changed_path = None;
@@ -801,7 +828,20 @@ impl SyncIndex {
         source: &Path,
         paths: Vec<PathBuf>,
     ) -> Result<(), Error> {
+        for path in &paths {
+            if path == source {
+                continue;
+            }
+            if path.starts_with(source) && !temporary_path(path) {
+                validate_source_path(source, path)?;
+            }
+        }
+
         for path in paths {
+            if path == source {
+                self.rescan(store, source).await?;
+                continue;
+            }
             if !path.starts_with(source) || temporary_path(&path) {
                 continue;
             }
@@ -1068,19 +1108,311 @@ fn object_prefix(source: &Path, relative: &Path) -> Result<ObjectPath, Error> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::NonUtf8Path(source.to_owned()))?;
+    let components = portable_components(relative)?;
     let mut prefix = ObjectPath::from(root);
 
-    for component in relative.components() {
-        let Component::Normal(component) = component else {
-            return Err(Error::InvalidPath(relative.to_owned()));
-        };
-        let component = component
-            .to_str()
-            .ok_or_else(|| Error::NonUtf8Path(relative.to_owned()))?;
+    for component in components {
         prefix = prefix.join(component);
     }
 
     Ok(prefix)
+}
+
+fn portable_path(value: &str) -> Result<PathBuf, ()> {
+    let path = VPath::parse(value).map_err(|_| ())?;
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        relative.push(component);
+    }
+    Ok(relative)
+}
+
+fn portable_components(path: &Path) -> Result<Vec<String>, Error> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(path.to_owned()));
+        };
+        let component = component
+            .to_str()
+            .ok_or_else(|| Error::NonUtf8Path(path.to_owned()))?;
+        if !component.is_ascii() {
+            return Err(Error::UnsupportedLocalFilename(path.to_owned()));
+        }
+        components.push(component.to_owned());
+    }
+    let portable =
+        portable_path(&components.join("/")).map_err(|_| Error::InvalidPath(path.to_owned()))?;
+    Ok(portable
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect())
+}
+
+fn validate_source_paths(source: &Path, paths: &[PathBuf]) -> Result<(), Error> {
+    let relative_paths = paths
+        .iter()
+        .map(|path| relative_path(source, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_portable_path_set(relative_paths)
+}
+
+fn validate_source_path(source: &Path, path: &Path) -> Result<(), Error> {
+    let relative = relative_path(source, path)?;
+    let components = portable_components(relative)?;
+    let mut parent = source.to_owned();
+    for component in components {
+        let metadata = match fs::symlink_metadata(&parent) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            break;
+        }
+        for entry in fs::read_dir(&parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name != component && names_may_collide(&name, &component) {
+                return Err(Error::PortablePathCollision(parent.join(name.as_ref())));
+            }
+        }
+        parent.push(component);
+    }
+    Ok(())
+}
+
+fn validate_portable_path_set<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<(), Error> {
+    let mut component_spellings = HashMap::new();
+    let mut full_paths = HashSet::new();
+
+    for path in paths {
+        let components = portable_components(path)?;
+        let mut parent = String::new();
+        let mut canonical = String::new();
+        for component in components {
+            let folded = component.to_ascii_lowercase();
+            let component_key = format!("{parent}/{folded}");
+            if let Some(previous) = component_spellings.get(&component_key)
+                && previous != &component
+            {
+                return Err(Error::PortablePathCollision(path.to_owned()));
+            }
+            component_spellings.insert(component_key, component);
+            if !canonical.is_empty() {
+                canonical.push('/');
+            }
+            canonical.push_str(&folded);
+            parent.clone_from(&canonical);
+        }
+        if !full_paths.insert(canonical.clone()) {
+            return Err(Error::PortablePathCollision(path.to_owned()));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_file_path_ancestors<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<(), Error> {
+    let mut canonical_paths = Vec::new();
+    let mut full_paths = HashSet::new();
+    for path in paths {
+        let components = portable_components(path)?;
+        let canonical = components
+            .iter()
+            .map(|component| component.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("/");
+        full_paths.insert(canonical.clone());
+        canonical_paths.push((canonical, path));
+    }
+
+    for (canonical, path) in canonical_paths {
+        let components = canonical.split('/').collect::<Vec<_>>();
+        for ancestor_length in 1..components.len() {
+            let ancestor = components[..ancestor_length].join("/");
+            if full_paths.contains(&ancestor) {
+                return Err(Error::PortablePathCollision(path.to_owned()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_destination_collisions(destination: &Path, paths: &[&Path]) -> Result<(), Error> {
+    let mut wanted_by_parent = HashMap::<PathBuf, HashMap<String, String>>::new();
+    for relative in paths {
+        let components = portable_components(relative)?;
+        let mut parent = destination.to_owned();
+        for component in components {
+            let wanted_names = wanted_by_parent.entry(parent.clone()).or_default();
+            wanted_names.insert(component.to_lowercase(), component.clone());
+            wanted_names.insert(component.to_uppercase(), component.clone());
+            parent.push(component);
+        }
+    }
+
+    for (parent, wanted_names) in wanted_by_parent {
+        let metadata = match fs::symlink_metadata(&parent) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(Error::SymbolicLink(parent));
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&parent)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let expected = wanted_names
+                .get(&name.to_lowercase())
+                .or_else(|| wanted_names.get(&name.to_uppercase()));
+            if let Some(expected) = expected
+                && name.as_ref() != expected.as_str()
+                && names_may_collide(&name, expected)
+            {
+                return Err(Error::PortablePathCollision(parent.join(name.as_ref())));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_destination_structure(
+    destination: &Path,
+    complete_paths: &HashSet<&Path>,
+    deleted_paths: &HashSet<&Path>,
+) -> Result<(), Error> {
+    for relative in complete_paths {
+        validate_complete_destination(destination, relative, deleted_paths)?;
+    }
+    for relative in deleted_paths {
+        let Some(path) = pull_existing_destination(destination, relative)? else {
+            continue;
+        };
+        reject_symbolic_link(&path)?;
+    }
+    Ok(())
+}
+
+fn validate_complete_destination(
+    destination: &Path,
+    relative: &Path,
+    deleted_paths: &HashSet<&Path>,
+) -> Result<(), Error> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::SymbolicLink(destination.to_owned()));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::NotDirectory(destination.to_owned()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut parent = destination.to_owned();
+    let mut relative_parent = PathBuf::new();
+    for component in relative.parent().unwrap_or(Path::new("")).components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(relative.to_owned()));
+        };
+        parent.push(component);
+        relative_parent.push(component);
+        match fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::SymbolicLink(parent));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) if deleted_paths.contains(relative_parent.as_path()) => return Ok(()),
+            Ok(_) => return Err(Error::NotDirectory(parent)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| Error::InvalidPath(relative.to_owned()))?;
+    let destination = parent.join(file_name);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::SymbolicLink(destination)),
+        Ok(metadata) if metadata.is_dir() => {
+            validate_complete_directory(&destination, relative, deleted_paths)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_complete_directory(
+    destination: &Path,
+    relative: &Path,
+    deleted_paths: &HashSet<&Path>,
+) -> Result<(), Error> {
+    let mut pending = vec![(destination.to_owned(), relative.to_owned())];
+    let mut directories = Vec::new();
+    let mut removable = deleted_paths
+        .iter()
+        .filter_map(|deleted| deleted.parent())
+        .filter(|parent| parent.starts_with(relative))
+        .map(Path::to_owned)
+        .collect::<HashSet<_>>();
+
+    while let Some((directory, relative_directory)) = pending.pop() {
+        directories.push(relative_directory.clone());
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(Error::SymbolicLink(path));
+            }
+
+            let relative_entry = relative_directory.join(entry.file_name());
+            if metadata.is_dir() {
+                pending.push((path, relative_entry));
+                continue;
+            }
+            if !deleted_paths.contains(relative_entry.as_path()) {
+                return Err(Error::DirectoryNotEmpty(destination.to_owned()));
+            }
+            if removable.contains(relative_entry.as_path()) {
+                // Pruning this entry before its own tombstone would call remove_dir on a file.
+                return Err(Error::DirectoryNotEmpty(destination.to_owned()));
+            }
+            removable.insert(relative_directory.clone());
+        }
+    }
+
+    // Pruning removes a nested directory only after deleting one of its descendants. Propagate
+    // that trigger upward; an unmarked directory would remain and make the final removal fail.
+    for directory in directories.iter().rev() {
+        if directory == relative {
+            continue;
+        }
+        if !removable.contains(directory) {
+            return Err(Error::DirectoryNotEmpty(destination.to_owned()));
+        }
+        let parent = directory
+            .parent()
+            .ok_or_else(|| Error::InvalidPath(directory.to_owned()))?;
+        removable.insert(parent.to_owned());
+    }
+    Ok(())
+}
+
+fn names_may_collide(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase() || left.to_uppercase() == right.to_uppercase()
 }
 
 fn read_chunk(reader: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
@@ -1118,6 +1450,7 @@ fn file_snapshot(path: &Path) -> io::Result<FileSnapshot> {
 pub enum Error {
     ChangedDuringUpload(PathBuf),
     ChunkTooLarge,
+    DirectoryNotEmpty(PathBuf),
     Dotenv(dotenvy::Error),
     InvalidChunk(String),
     InvalidManifest(&'static str),
@@ -1128,9 +1461,12 @@ pub enum Error {
     NonUtf8Path(PathBuf),
     NotDirectory(PathBuf),
     PartialFileCollision,
+    PortablePathCollision(PathBuf),
     Store(object_store::Error),
     SymbolicLink(PathBuf),
     TooManyFiles,
+    UnsupportedLocalFilename(PathBuf),
+    UnsupportedRemoteFilename(String),
     Watcher(notify::Error),
     WatcherStopped,
 }
@@ -1142,6 +1478,9 @@ impl fmt::Display for Error {
                 write!(formatter, "{} changed during upload", path.display())
             }
             Self::ChunkTooLarge => write!(formatter, "chunk count is too large"),
+            Self::DirectoryNotEmpty(path) => {
+                write!(formatter, "directory is not empty: {}", path.display())
+            }
             Self::Dotenv(error) => error.fmt(formatter),
             Self::InvalidChunk(path) => write!(formatter, "invalid chunk: {path}"),
             Self::InvalidManifest(message) => write!(formatter, "invalid manifest: {message}"),
@@ -1156,11 +1495,30 @@ impl fmt::Display for Error {
             Self::PartialFileCollision => {
                 write!(formatter, "could not create a unique partial file")
             }
+            Self::PortablePathCollision(path) => write!(
+                formatter,
+                "path collides with another name on a case-insensitive filesystem: {}",
+                path.display()
+            ),
             Self::Store(error) => error.fmt(formatter),
             Self::SymbolicLink(path) => {
                 write!(formatter, "refusing symbolic link: {}", path.display())
             }
             Self::TooManyFiles => write!(formatter, "source has more than {MAX_FILE_COUNT} files"),
+            Self::UnsupportedLocalFilename(path) => write!(
+                formatter,
+                "cannot sync UTF-8 Unicode filename at {}; the portable filename policy currently accepts ASCII only",
+                path.display()
+            ),
+            Self::UnsupportedRemoteFilename(path) => write!(
+                formatter,
+                concat!(
+                    "cannot safely pull UTF-8 Unicode filename from {}; ",
+                    "this version preserves the remote key but requires compatible Unicode ",
+                    "filename support or a separate export"
+                ),
+                path
+            ),
             Self::Watcher(error) => error.fmt(formatter),
             Self::WatcherStopped => write!(formatter, "file watcher stopped"),
         }
@@ -1226,6 +1584,50 @@ mod tests {
             .join("manifest");
         let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn put_empty_complete_manifest(store: &InMemory, path: &ObjectPath) {
+        store
+            .put(
+                path,
+                Bytes::from("version=2\nsize=0\nchunk_size=1048576\nstate=complete\n").into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn create_test_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_test_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_unavailable(error: &io::Error) -> bool {
+        error.raw_os_error() == Some(1314)
+            || matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            )
+    }
+
+    #[cfg(unix)]
+    fn symlink_unavailable(_error: &io::Error) -> bool {
+        false
     }
 
     struct TransferTiming {
@@ -1406,13 +1808,27 @@ mod tests {
         let file = source.0.join("archive.txt");
         fs::write(&file, "old").unwrap();
         let time = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file)
+        match fs::set_times(&file, fs::FileTimes::new().set_modified(time)) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not set fixture timestamp: {error}"),
+        }
+        if fs::metadata(&file)
             .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(time))
-            .unwrap();
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .is_ok()
+        {
+            return;
+        }
         let store = InMemory::new();
         let mut index = SyncIndex::new();
 
@@ -1424,6 +1840,37 @@ mod tests {
         let mut restarted = SyncIndex::load(&store, &source.0).await.unwrap();
         restarted.rescan(&store, &source.0).await.unwrap();
         assert_eq!(manifest(&store, &source.0, "archive.txt").await, before);
+    }
+
+    #[tokio::test]
+    async fn serializes_negative_file_timestamps_without_filesystem_support() {
+        let store = InMemory::new();
+        let manifest_path = ObjectPath::from("root/archive.txt/manifest");
+        let snapshot = FileSnapshot {
+            length: 3,
+            modified_ns: -1,
+        };
+
+        put_manifest(
+            &store,
+            &manifest_path,
+            3,
+            "complete",
+            Some("generation"),
+            Some(&snapshot),
+        )
+        .await
+        .unwrap();
+
+        let manifest = store
+            .get(&manifest_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifest = String::from_utf8(manifest.to_vec()).unwrap();
+        assert!(manifest.contains("modified_ns_signed=-1\n"));
     }
 
     #[test]
@@ -1511,6 +1958,38 @@ mod tests {
             Manifest::parse(duplicate_signed_timestamp.as_bytes()),
             Err(Error::InvalidManifest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn watcher_root_event_rescans_without_bypassing_child_validation() {
+        let source = TestDirectory::new();
+        let file = source.0.join("existing.txt");
+        fs::write(&file, b"existing contents").unwrap();
+        let store = InMemory::new();
+        let mut index = SyncIndex::new();
+
+        index
+            .apply_paths(&store, &source.0, vec![source.0.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(index.file_count(), 1);
+        assert!(index.files.contains_key(&file));
+        assert!(
+            manifest(&store, &source.0, "existing.txt")
+                .await
+                .contains("state=complete\n")
+        );
+
+        let invalid = source.0.join("invalid:name.txt");
+        assert!(matches!(
+            index
+                .apply_paths(&store, &source.0, vec![source.0.clone(), invalid])
+                .await,
+            Err(Error::InvalidPath(_))
+        ));
+        assert_eq!(index.file_count(), 1);
+        assert!(index.files.contains_key(&file));
     }
 
     #[cfg(unix)]
@@ -1624,6 +2103,113 @@ mod tests {
                 .join("nested/hello.txt.infinitefs-partial")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn pull_replaces_an_existing_regular_file() {
+        let source = TestDirectory::new();
+        let contents = b"remote contents";
+        fs::write(source.0.join("hello.txt"), contents).unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+        let destination = TestDirectory::new();
+        fs::write(destination.0.join("hello.txt"), b"old local contents").unwrap();
+
+        pull_directory(
+            &store,
+            source.0.file_name().unwrap().to_str().unwrap(),
+            &destination.0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(destination.0.join("hello.txt")).unwrap(), contents);
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_a_final_component_symlink() {
+        let source = TestDirectory::new();
+        fs::write(source.0.join("hello.txt"), b"remote contents").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+        let destination = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let outside_file = outside.0.join("keep.txt");
+        fs::write(&outside_file, b"keep local contents").unwrap();
+        if let Err(error) =
+            create_test_file_symlink(&outside_file, &destination.0.join("hello.txt"))
+        {
+            if symlink_unavailable(&error) {
+                eprintln!("skipping symlink test: {error}");
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+
+        assert!(matches!(
+            pull_directory(
+                &store,
+                source.0.file_name().unwrap().to_str().unwrap(),
+                &destination.0,
+            )
+            .await,
+            Err(Error::SymbolicLink(_))
+        ));
+        assert_eq!(fs::read(outside_file).unwrap(), b"keep local contents");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pull_preserves_open_destination_when_windows_denies_replacement() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let source = TestDirectory::new();
+        fs::write(source.0.join("hello.txt"), b"remote contents").unwrap();
+        let store = InMemory::new();
+        SyncIndex::new().rescan(&store, &source.0).await.unwrap();
+        let manifest_path = object_prefix(&source.0, Path::new("hello.txt"))
+            .unwrap()
+            .join("manifest");
+        let manifest = Manifest::parse(
+            &store
+                .get(&manifest_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let destination = TestDirectory::new();
+        let destination_file = destination.0.join("hello.txt");
+        fs::write(&destination_file, b"old local contents").unwrap();
+        let mut options = fs::OpenOptions::new();
+        options.read(true).share_mode(0);
+        let locked = options.open(&destination_file).unwrap();
+
+        assert!(
+            pull_file(
+                &store,
+                &manifest_path,
+                &manifest,
+                &destination.0,
+                Path::new("hello.txt"),
+            )
+            .await
+            .is_err()
+        );
+        drop(locked);
+        assert_eq!(fs::read(&destination_file).unwrap(), b"old local contents");
+        pull_file(
+            &store,
+            &manifest_path,
+            &manifest,
+            &destination.0,
+            Path::new("hello.txt"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(&destination_file).unwrap(), b"remote contents");
     }
 
     #[tokio::test]
@@ -1859,11 +2445,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn pull_rejects_symbolic_link_ancestors() {
-        use std::os::unix::fs::symlink;
-
         let source = TestDirectory::new();
         let file = source.0.join("nested/hello.txt");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1873,7 +2456,14 @@ mod tests {
 
         let destination = TestDirectory::new();
         let outside = TestDirectory::new();
-        symlink(&outside.0, destination.0.join("nested")).unwrap();
+        if let Err(error) = create_test_directory_symlink(&outside.0, &destination.0.join("nested"))
+        {
+            if symlink_unavailable(&error) {
+                eprintln!("skipping symlink test: {error}");
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
         let root = source.0.file_name().unwrap().to_str().unwrap();
 
         assert!(matches!(
@@ -1883,16 +2473,20 @@ mod tests {
         assert!(!outside.0.join("hello.txt").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn pull_delete_rejects_symbolic_link_ancestors() {
-        use std::os::unix::fs::symlink;
-
         let destination = TestDirectory::new();
         let outside = TestDirectory::new();
         let outside_file = outside.0.join("delete-me.txt");
         fs::write(&outside_file, "keep").unwrap();
-        symlink(&outside.0, destination.0.join("nested")).unwrap();
+        if let Err(error) = create_test_directory_symlink(&outside.0, &destination.0.join("nested"))
+        {
+            if symlink_unavailable(&error) {
+                eprintln!("skipping symlink test: {error}");
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
 
         assert!(matches!(
             pull_deleted(&destination.0, Path::new("nested/delete-me.txt")),
@@ -1925,6 +2519,488 @@ mod tests {
     }
 
     #[test]
+    fn upload_and_pull_reject_the_same_nonportable_component() {
+        assert!(matches!(
+            object_prefix(Path::new("root"), Path::new("folder/Bad:name")),
+            Err(Error::InvalidPath(_))
+        ));
+        assert!(
+            manifest_relative(
+                &ObjectPath::from("root"),
+                &ObjectPath::from("root/folder/Bad:name/manifest"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn upload_rejects_unicode_filename_with_actionable_error() {
+        let error = object_prefix(Path::new("root"), Path::new("résumé.txt")).unwrap_err();
+
+        assert!(matches!(error, Error::UnsupportedLocalFilename(_)));
+        assert!(error.to_string().contains("accepts ASCII only"));
+    }
+
+    #[test]
+    fn portable_path_set_rejects_case_and_directory_collisions() {
+        assert!(matches!(
+            validate_portable_path_set([Path::new("Readme.txt"), Path::new("README.txt")]),
+            Err(Error::PortablePathCollision(_))
+        ));
+        assert!(matches!(
+            validate_portable_path_set([Path::new("Dir/one.txt"), Path::new("dir/two.txt")]),
+            Err(Error::PortablePathCollision(_))
+        ));
+    }
+
+    #[test]
+    fn destination_case_check_catches_unicode_mappings_to_ascii() {
+        assert!(names_may_collide("K.txt", "K.txt"));
+        assert!(names_may_collide("ſ.txt", "S.txt"));
+    }
+
+    #[test]
+    fn complete_file_paths_cannot_be_ancestors_of_each_other() {
+        assert!(matches!(
+            validate_file_path_ancestors([Path::new("file"), Path::new("file/child")]),
+            Err(Error::PortablePathCollision(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_remote_case_collisions_before_writing() {
+        let store = InMemory::new();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/Readme.txt/manifest")).await;
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/README.txt/manifest")).await;
+        let destination = TestDirectory::new();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::PortablePathCollision(_))
+        ));
+        assert!(fs::read_dir(&destination.0).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_preserves_tombstone_when_complete_has_file_ancestor() {
+        let store = InMemory::new();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/old.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/nested/file.txt/manifest"))
+            .await;
+        let destination = TestDirectory::new();
+        let old_file = destination.0.join("old.txt");
+        let conflicting_ancestor = destination.0.join("nested");
+        fs::write(&old_file, b"keep old file").unwrap();
+        fs::write(&conflicting_ancestor, b"keep ancestor file").unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::NotDirectory(_))
+        ));
+        assert_eq!(fs::read(old_file).unwrap(), b"keep old file");
+        assert_eq!(
+            fs::read(conflicting_ancestor).unwrap(),
+            b"keep ancestor file"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_preserves_tombstone_when_complete_directory_cannot_be_removed() {
+        let store = InMemory::new();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/old.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/target/manifest")).await;
+        let destination = TestDirectory::new();
+        let old_file = destination.0.join("old.txt");
+        let target = destination.0.join("target");
+        let local_file = target.join("notes.txt");
+        fs::write(&old_file, b"keep old file").unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(&local_file, b"keep local file").unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::DirectoryNotEmpty(path)) if path == target
+        ));
+        assert_eq!(fs::read(old_file).unwrap(), b"keep old file");
+        assert_eq!(fs::read(local_file).unwrap(), b"keep local file");
+        let entries = fs::read_dir(&destination.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            !entries
+                .iter()
+                .any(|name| { name.to_string_lossy().starts_with(".infinitefs-partial-") })
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_allows_empty_directory_to_become_file() {
+        let store = InMemory::new();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/target/manifest")).await;
+        let destination = TestDirectory::new();
+        let target = destination.0.join("target");
+        fs::create_dir(&target).unwrap();
+
+        let result = pull_directory(&store, "root", &destination.0)
+            .await
+            .unwrap();
+
+        assert_eq!(result.file_count, 1);
+        assert!(target.is_file());
+        assert_eq!(fs::read(target).unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_allows_missing_tombstone_target_to_prune_empty_parent() {
+        let store = InMemory::new();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/target/manifest")).await;
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/target/empty/missing.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let destination = TestDirectory::new();
+        let target = destination.0.join("target");
+        let unrelated = destination.0.join("unrelated.txt");
+        fs::create_dir_all(target.join("empty")).unwrap();
+        fs::write(&unrelated, b"keep unrelated file").unwrap();
+
+        let result = pull_directory(&store, "root", &destination.0)
+            .await
+            .unwrap();
+
+        assert_eq!(result.file_count, 1);
+        assert!(target.is_file());
+        assert_eq!(fs::read(target).unwrap(), b"");
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep unrelated file");
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_missing_target_trigger_preserves_unrelated_directory() {
+        let store = InMemory::new();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/old.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/target/prunable/missing.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/target/manifest")).await;
+        let destination = TestDirectory::new();
+        let old_file = destination.0.join("old.txt");
+        let target = destination.0.join("target");
+        let prunable = target.join("prunable");
+        let unrelated = target.join("unrelated-directory");
+        fs::write(&old_file, b"keep old file").unwrap();
+        fs::create_dir_all(&prunable).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::DirectoryNotEmpty(path)) if path == target
+        ));
+        assert_eq!(fs::read(old_file).unwrap(), b"keep old file");
+        assert!(prunable.is_dir());
+        assert!(unrelated.is_dir());
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_rejects_pruning_that_depends_on_tombstone_order() {
+        let store = InMemory::new();
+        for relative in ["old.txt", "target/file", "target/file/missing.txt"] {
+            put_manifest(
+                &store,
+                &ObjectPath::from(format!("root/{relative}/manifest")),
+                0,
+                "deleted",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/target/manifest")).await;
+        let destination = TestDirectory::new();
+        let old_file = destination.0.join("old.txt");
+        let target = destination.0.join("target");
+        let conflicting_file = target.join("file");
+        fs::write(&old_file, b"keep old file").unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(&conflicting_file, b"keep file until safe").unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::DirectoryNotEmpty(path)) if path == target
+        ));
+        assert_eq!(fs::read(old_file).unwrap(), b"keep old file");
+        assert_eq!(fs::read(conflicting_file).unwrap(), b"keep file until safe");
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_allows_directory_emptied_by_tombstones_to_become_file() {
+        let store = InMemory::new();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/target/manifest")).await;
+        for relative in ["target/one.txt", "target/nested/two.txt"] {
+            put_manifest(
+                &store,
+                &ObjectPath::from(format!("root/{relative}/manifest")),
+                0,
+                "deleted",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let destination = TestDirectory::new();
+        let target = destination.0.join("target");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("one.txt"), b"old one").unwrap();
+        fs::write(target.join("nested/two.txt"), b"old two").unwrap();
+
+        let result = pull_directory(&store, "root", &destination.0)
+            .await
+            .unwrap();
+
+        assert_eq!(result.file_count, 1);
+        assert!(target.is_file());
+        assert_eq!(fs::read(target).unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_rejects_directory_with_unprunable_child() {
+        let store = InMemory::new();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/old.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/target/deleted.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/target/manifest")).await;
+        let destination = TestDirectory::new();
+        let old_file = destination.0.join("old.txt");
+        let target = destination.0.join("target");
+        let deleted_file = target.join("deleted.txt");
+        let local_directory = target.join("local-directory");
+        fs::write(&old_file, b"keep old file").unwrap();
+        fs::create_dir_all(&local_directory).unwrap();
+        fs::write(&deleted_file, b"planned deletion").unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::DirectoryNotEmpty(path)) if path == target
+        ));
+        assert_eq!(fs::read(old_file).unwrap(), b"keep old file");
+        assert_eq!(fs::read(deleted_file).unwrap(), b"planned deletion");
+        assert!(local_directory.is_dir());
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_allows_tombstoned_file_to_become_directory() {
+        let store = InMemory::new();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/nested/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/nested/file.txt/manifest"))
+            .await;
+        let destination = TestDirectory::new();
+        let replaced_file = destination.0.join("nested");
+        fs::write(&replaced_file, b"old file").unwrap();
+
+        let result = pull_directory(&store, "root", &destination.0)
+            .await
+            .unwrap();
+
+        assert_eq!(result.file_count, 1);
+        assert!(replaced_file.is_dir());
+        assert_eq!(fs::read(replaced_file.join("file.txt")).unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn pull_preflight_preserves_tombstone_when_complete_target_is_symlink() {
+        let store = InMemory::new();
+        put_manifest(
+            &store,
+            &ObjectPath::from("root/old.txt/manifest"),
+            0,
+            "deleted",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/linked.txt/manifest")).await;
+        let destination = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let old_file = destination.0.join("old.txt");
+        let link = destination.0.join("linked.txt");
+        let target = outside.0.join("target.txt");
+        fs::write(&old_file, b"keep old file").unwrap();
+        fs::write(&target, b"keep target file").unwrap();
+        if let Err(error) = create_test_file_symlink(&target, &link) {
+            if symlink_unavailable(&error) {
+                eprintln!("skipping symlink test: {error}");
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::SymbolicLink(_))
+        ));
+        assert_eq!(fs::read(old_file).unwrap(), b"keep old file");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"keep target file");
+    }
+
+    #[test]
+    fn pull_preflight_preserves_tombstone_when_deleted_target_is_symlink() {
+        let destination = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let old_file = destination.0.join("old.txt");
+        let link = destination.0.join("linked.txt");
+        let target = outside.0.join("target.txt");
+        fs::write(&old_file, b"keep old file").unwrap();
+        fs::write(&target, b"keep target file").unwrap();
+        if let Err(error) = create_test_file_symlink(&target, &link) {
+            if symlink_unavailable(&error) {
+                eprintln!("skipping symlink test: {error}");
+                return;
+            }
+            panic!("could not create symlink fixture: {error}");
+        }
+
+        let deleted = vec![PathBuf::from("old.txt"), PathBuf::from("linked.txt")];
+        let complete_paths = HashSet::new();
+
+        assert!(matches!(
+            pull_directory_apply_tombstones(&destination.0, &deleted, &complete_paths),
+            Err(Error::SymbolicLink(_))
+        ));
+        assert_eq!(fs::read(old_file).unwrap(), b"keep old file");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"keep target file");
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_case_collision_with_existing_destination() {
+        let store = InMemory::new();
+        put_empty_complete_manifest(&store, &ObjectPath::from("root/README.txt/manifest")).await;
+        let destination = TestDirectory::new();
+        fs::write(destination.0.join("Readme.txt"), b"keep local file").unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::PortablePathCollision(_))
+        ));
+        assert_eq!(
+            fs::read(destination.0.join("Readme.txt")).unwrap(),
+            b"keep local file"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_remote_leading_space_without_overwriting_local_file() {
+        let store = InMemory::new();
+        let manifest_path = ObjectPath::from("root/ report.txt/manifest");
+        put_empty_complete_manifest(&store, &manifest_path).await;
+        let destination = TestDirectory::new();
+        let local_file = destination.0.join("report.txt");
+        fs::write(&local_file, b"keep local contents").unwrap();
+
+        assert!(matches!(
+            pull_directory(&store, "root", &destination.0).await,
+            Err(Error::InvalidRemotePath(_))
+        ));
+        assert_eq!(fs::read(local_file).unwrap(), b"keep local contents");
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_unicode_manifest_with_actionable_error() {
+        let store = InMemory::new();
+        let manifest_path = ObjectPath::from("root/résumé.txt/manifest");
+        put_empty_complete_manifest(&store, &manifest_path).await;
+        let destination = TestDirectory::new();
+
+        let error = pull_directory(&store, "root", &destination.0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::UnsupportedRemoteFilename(_)));
+        assert!(error.to_string().contains("Unicode filename support"));
+        assert!(fs::read_dir(&destination.0).unwrap().next().is_none());
+    }
+
+    #[test]
     fn manifest_relative_accepts_dotfiles() {
         let prefix = ObjectPath::from("root");
         let manifest = ObjectPath::from("root/.gitignore/manifest");
@@ -1932,6 +3008,18 @@ mod tests {
         assert_eq!(
             manifest_relative(&prefix, &manifest).unwrap(),
             Path::new(".gitignore")
+        );
+    }
+
+    #[test]
+    fn object_keys_round_trip_percent_and_spaces() {
+        let source = Path::new("source");
+        let relative = Path::new("100%20 done.txt");
+        let object = object_prefix(source, relative).unwrap().join("manifest");
+
+        assert_eq!(
+            manifest_relative(&ObjectPath::from("source"), &object).unwrap(),
+            relative
         );
     }
 
