@@ -13,9 +13,30 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.99
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Check minimum supported version
+        run: cargo check --locked
+
   test:
     name: Format, Lint, and Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
 
     steps:
       - name: Checkout repository
@@ -30,7 +51,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Compile project
         run: cargo check --locked

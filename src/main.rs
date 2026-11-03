@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 mod core;
 mod platform;
+pub mod remote_reader;
 mod sync;
 mod tui;
 #[allow(dead_code)]

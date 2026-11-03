@@ -3,9 +3,10 @@
 //! A virtual path is independent of any operating system. Backends translate
 //! it into native paths (local) or keys (cloud); no other code interprets
 //! path strings. The rules here are therefore stricter than POSIX: `/` is the
-//! only separator, `\` and `:` are rejected instead of translated, and every
-//! accepted path is portable to every platform we support. One unambiguous
-//! meaning everywhere is worth rejecting a few unusual but legal filenames.
+//! only separator, native path syntax is rejected, and every accepted
+//! component has one portable meaning on Windows, Linux, and macOS. Names are
+//! limited to ASCII so case collisions and Unicode normalization cannot vary
+//! by filesystem.
 //!
 //! Rules, and why they exist:
 //!
@@ -18,20 +19,23 @@
 //!   syntax, which must never leak into the virtual namespace.
 //! - `.` and `..` are rejected as components: they are traversal, and the
 //!   namespace does not need them.
-//! - Components cannot start with `.`: leading dots hide files on POSIX and
-//!   invite confusion with `.` and `..`.
-//! - Components cannot end with `.`: Windows strips trailing dots, so such a
-//!   name would not round-trip.
-//! - Components are limited to 255 bytes: the common POSIX `NAME_MAX`.
-//! - Components use ASCII letters, digits, `.`, `_` and `-` only: a narrow
-//!   portable subset avoids Unicode normalization mismatches between
-//!   filesystems and keeps cloud keys unambiguous.
+//! - Dotfiles are allowed, while `.` and `..` are rejected as traversal.
+//! - Components cannot begin or end with an ASCII space, or end with `.`:
+//!   Windows strips leading and trailing spaces and trailing dots, so the name
+//!   would not round-trip.
+//! - Components are limited to 255 bytes by the InfiniteFS virtual namespace.
+//!   This is a per-component policy, not a guarantee about every filesystem's
+//!   component limit or the maximum length of a complete path.
+//! - Components use printable ASCII except Windows path syntax. Percent signs
+//!   round-trip through object-store path encoding, while rejecting Unicode
+//!   avoids normalization differences between filesystems.
 //! - Windows device names (`CON`, `NUL`, `COM1`, ...) are rejected: a virtual
 //!   path must be usable on every platform we support.
 
 use std::io;
 
-/// POSIX guarantees `NAME_MAX` of at least 255 bytes on the systems we target.
+/// InfiniteFS limits each component to 255 bytes; filesystems can impose
+/// smaller component limits, and total path limits are separate.
 const MAX_COMPONENT_BYTES: usize = 255;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -81,12 +85,12 @@ fn validate_component(component: &str) -> io::Result<()> {
         return Err(invalid("Path components cannot be '.' or '..'"));
     }
 
-    if component.starts_with('.') {
-        return Err(invalid("Path components cannot start with '.'"));
+    if component.starts_with(' ') {
+        return Err(invalid("Path components cannot begin with a space"));
     }
 
-    if component.ends_with('.') {
-        return Err(invalid("Path components cannot end with '.'"));
+    if component.ends_with(['.', ' ']) {
+        return Err(invalid("Path components cannot end with a dot or space"));
     }
 
     if component.len() > MAX_COMPONENT_BYTES {
@@ -94,9 +98,7 @@ fn validate_component(component: &str) -> io::Result<()> {
     }
 
     if !component.bytes().all(is_allowed_byte) {
-        return Err(invalid(
-            "Path components may only contain ASCII letters, digits, '.', '_' and '-'",
-        ));
+        return Err(invalid("Path component contains a non-portable character"));
     }
 
     if is_reserved_device_name(component) {
@@ -107,7 +109,11 @@ fn validate_component(component: &str) -> io::Result<()> {
 }
 
 fn is_allowed_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+    (0x20..=0x7e).contains(&byte)
+        && !matches!(
+            byte,
+            b'<' | b'>' | b':' | b'"' | b'/' | b'\\' | b'|' | b'?' | b'*'
+        )
 }
 
 fn is_reserved_device_name(component: &str) -> bool {
@@ -115,12 +121,15 @@ fn is_reserved_device_name(component: &str) -> bool {
         .split('.')
         .next()
         .unwrap_or("")
-        .to_ascii_uppercase();
+        .trim_end_matches([' ', '.']);
+    let stem = stem.to_ascii_uppercase();
 
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || (stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -147,11 +156,26 @@ mod tests {
     }
 
     #[test]
-    fn accepts_allowed_characters() {
+    fn accepts_portable_characters_and_dotfiles() {
         assert_eq!(
-            parse_components("reports/2026-01_summary.v2.txt"),
-            ["reports", "2026-01_summary.v2.txt"]
+            parse_components("reports/.env/100%20 done.v2.txt"),
+            ["reports", ".env", "100%20 done.v2.txt"]
         );
+    }
+
+    #[test]
+    fn rejects_leading_space_components() {
+        for path in [" name.txt", "nested/ name.txt"] {
+            assert!(
+                VPath::parse(path).is_err(),
+                "path should be rejected: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_interior_spaces() {
+        assert_eq!(parse_components("a name.txt"), ["a name.txt"]);
     }
 
     #[test]
@@ -205,8 +229,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_leading_dots() {
-        for path in [".hidden", "a/.hidden", ".config/file.txt"] {
+    fn accepts_dotfiles_and_rejects_dot_components() {
+        for path in [".env", ".gitignore", ".config/file"] {
+            assert!(
+                VPath::parse(path).is_ok(),
+                "path should be accepted: {path}"
+            );
+        }
+        for path in [".", "..", "a/../b"] {
             assert!(
                 VPath::parse(path).is_err(),
                 "path should be rejected: {path}"
@@ -216,7 +246,7 @@ mod tests {
 
     #[test]
     fn rejects_trailing_dots() {
-        for path in ["file.", "dir./file", "a.b."] {
+        for path in ["file.", "dir./file", "a.b.", "name "] {
             assert!(
                 VPath::parse(path).is_err(),
                 "path should be rejected: {path}"
@@ -227,13 +257,16 @@ mod tests {
     #[test]
     fn rejects_disallowed_characters() {
         for path in [
-            "hello world.txt",
             "café.txt",
             "star*.txt",
+            "angle<.txt",
+            "angle>.txt",
             "question?.txt",
             "pipe|.txt",
             "tab\t.txt",
             "quote\".txt",
+            "non-ASCII-é",
+            "control\u{1}.txt",
         ] {
             assert!(
                 VPath::parse(path).is_err(),
@@ -262,6 +295,9 @@ mod tests {
             "COM1",
             "LPT9",
             "folder/COM3.txt",
+            "CON .txt",
+            "CONIN$",
+            "CONOUT$.log",
         ] {
             assert!(
                 VPath::parse(path).is_err(),
